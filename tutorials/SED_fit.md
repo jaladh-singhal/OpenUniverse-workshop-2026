@@ -4,7 +4,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.18.1
+    jupytext_version: 1.19.1
 kernelspec:
   name: python3
   display_name: python3
@@ -62,7 +62,7 @@ starttime = time.time()
 
 ```{code-cell} ipython3
 # Uncomment to install dependencies if needed.
-# %pip install "numpy<2.0" pandas h5py matplotlib seaborn pyarrow gdown
+# %pip install numpy pandas h5py matplotlib seaborn pyarrow gdown
 # FSPS + Prospector + SEDPY+ dynasty are required for SED modeling
 # %pip install astro-prospector astro-sedpy "dynesty<2.0.0" fsps
 ```
@@ -461,7 +461,7 @@ def photons_to_maggies_with_filter(photon_flux, filt):
     lam = filt.wave_effective   # effective wavelength [Å]
 
     # Effective filter width in Å (integral of throughput)
-    delta_lambda = np.trapz(filt.transmission, filt.wavelength)
+    delta_lambda = np.trapezoid(filt.transmission, filt.wavelength)
 
     # photon energy at central wavelength
     E_photon = h * c / lam
@@ -689,13 +689,15 @@ def plot_many_seds(df, rubin_bands, roman_bands, n_galaxies=10, loglog=False):
 plot_many_seds(df_scaled, rubin_bands, roman_bands, n_galaxies=50, loglog=True)
 ```
 
++++ {"jupyter": {"source_hidden": true}}
+
 ## 3. SED fitting
 In this section we will use [Prospector](https://prospect.readthedocs.io/en/stable/index.html), a Bayesian SED fitting code built on [FSPS](https://dfm.io/python-fsps/current/), to infer stellar population parameters for our galaxies by fitting their SEDs.  We choose Prospector because it is an open-source, powerful, yet flexible package to infer stellar population properties that is widely used in the community.
 
 There are two ways to proceed, depending on whether you want to *run your own fits* or *use existing results*.
 
 ### Option A — Run new fits (slow)
-This option performs fresh Prospector fits for a small subset of galaxies (five by default).
+This option performs fresh Prospector fits for a small subset of galaxies (20 by default).
 It is the most transparent path, showing every step of the fitting process and how the models are generated.
 However, it is computationally expensive — each fit can take several minutes, and the total run may exceed half an hour on a modest machine.
 
@@ -949,7 +951,6 @@ def run_fit(obs, model_params, sps, lnprobfn, noise_model, fitting_kwargs):
     print(f"[Galaxy {galaxy_id}] Finished fit and post processing.")
 
     return processed
-
 ```
 
 ```{code-cell} ipython3
@@ -1136,10 +1137,9 @@ This cell prepares the data for fitting by choosing a small subset of galaxies t
 
 ```{code-cell} ipython3
 # Select a small subset of galaxies to fit
-#increasing this number will increase fitting time
-#df_small = df_scaled.iloc[0:5].copy()
 
 # --- Select 10 SN Ia and 10 Core-Collapse (CC) host galaxies for fitting ---
+#increasing this number will increase fitting time
 
 # Identify Type Ia and Core-Collapse SNe by model_name
 # OpenUniverse2024 convention: "SALT3.NIR_WAVEEXT" → Type Ia
@@ -1753,7 +1753,7 @@ Distribution of Prospector-derived host galaxy stellar masses for Type Ia and Co
 **Authors:** IRSA Data Science Team, including Jessica Krick, Troy Raen, Brigitta Sipőcz,
 Andreas Faisst, Vandana Desai, Jaladh Singhal
 
-**Updated:** 2025-11-03
+**Updated:** 2026-02-12
 
 **Contact:** [IRSA Helpdesk](https://irsa.ipac.caltech.edu/docs/help_desk.html) with questions
 or problems.
