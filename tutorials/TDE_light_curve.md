@@ -72,6 +72,7 @@ import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
 import json
+from astroquery.ipac.irsa import Irsa
 
 import itertools
 ```
@@ -367,14 +368,41 @@ df_candidates
 Now we need to find the filenames of the images in the TDS survey which include these targets
 
 ```{code-cell} ipython3
+# Make astroquery IRSA queries point to the simulated VO endpoints
+# Must be connected to IPAC VPN or local network to access these endpoints
+# TODO: replace irsadev with irsa when simulated SIA is deployed to Ops
+Irsa.sia_url = "https://irsadev.ipac.caltech.edu/simulated/SIA"
+Irsa.tap_url = "https://irsadev.ipac.caltech.edu/simulated/TAP"
+
+Irsa.list_collections(servicetype='SIA')
+```
+
+```{code-cell} ipython3
+OU_ROMAN_SIA_COLLECTION = 'simulated_roman_troxel2024'
+OU_RUBIN_SIA_COLLECTION = 'simulated_rubin_troxel2024'
+```
+
+```{code-cell} ipython3
 ---
 jupyter:
   source_hidden: true
 ---
-def TDS_image_search(ra_center, dec_center, radius_deg, bandname,
-                    s3_prefix=f"{BUCKET_NAME}/{OU_PREFIX}/{ROMAN_TDS_PREFIX}/"):
+def get_s3_fpath(cloud_access):
+    cloud_info = json.loads(cloud_access) # converts str to dict
+    bucket_name = cloud_info['aws']['bucket_name']
+    key = cloud_info['aws']['key']
+
+    return f's3://{bucket_name}/{key}'
+```
+
+```{code-cell} ipython3
+---
+jupyter:
+  source_hidden: true
+---
+def TDS_image_search(ra_center, dec_center, radius_deg, bandname):
     """
-    Query OpenUniverse2024 Roman/Rubin TDS images within a given sky radius.
+    Query OpenUniverse2024 Roman TDS images within a given sky radius.
 
     Parameters
     ----------
@@ -386,26 +414,20 @@ def TDS_image_search(ra_center, dec_center, radius_deg, bandname,
         Search radius in degrees.
     bandname : string
         bandname for which to do photometry
-    s3_prefix : str, optional
-        Root path to the OpenUniverse Roman/Rubin images on S3.
 
     Returns
     -------
     image_filenames : list (str)
         Should start with the str "s3://"
     """
+    coords = SkyCoord(ra_center, dec_center, unit='deg')
+    size = radius_deg * u.deg
 
-    # This is a fudging of the image access part so I can keep working
-    image_filenames = [
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_10.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_11.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_12.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_13.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_14.fits.gz']
-
-    #make these the correct path with the s3 prepended on the front
-    image_filenames = [f"s3://{path}" for path in image_filenames]
-
+    sia_results = Irsa.query_sia(pos=(coords, size), collection=OU_ROMAN_SIA_COLLECTION)
+    filtered_results = sia_results[['TDS_simple_model' in row['obs_id'] and bandname in row['energy_bandpassname']
+                                    for row in sia_results]]
+    
+    image_filenames = [get_s3_fpath(row['cloud_access']) for row in filtered_results]
     return image_filenames
 ```
 
@@ -439,9 +461,11 @@ def add_image_filenames(df_candidates, radius_deg, bandname):
     # Store filenames for each candidate
     filenames_all = []
 
-    for idx, row in df_candidates.iterrows():
+    for _, row in df_candidates.iterrows():
         ra, dec = row["ra"], row["dec"]
+        print(f"Accessing images in band={bandname} for candidate at RA={ra:.3f}, Dec={dec:.3f} ...", end="")
         filenames = TDS_image_search(ra, dec, radius_deg, bandname)
+        print(f"done. Found {len(filenames)} images.")
         filenames_all.append(filenames)
 
     df_candidates["image_filenames"] = filenames_all
@@ -451,7 +475,7 @@ def add_image_filenames(df_candidates, radius_deg, bandname):
 
 ```{code-cell} ipython3
 bandname = "J129"
-df_candidates = add_image_filenames(df_candidates, radius_deg, bandname)
+df_candidates = add_image_filenames(df_candidates, radius_deg.value, bandname)
 ```
 
 ```{code-cell} ipython3
@@ -495,7 +519,10 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
 
     #for each candidate galaxy:
     for idx, row in df_candidates.iterrows():
-        filenames = row["image_filenames"]
+        filenames = row["image_filenames"][:10]  # limit to first 10 images for speed; fix later
+        print(f"Performing photometry for {len(filenames)}/{len(row['image_filenames'])} images "
+              f"for the candidate at RA={row['ra']:.3f}, Dec={row['dec']:.3f} ...", end="")
+
 
         #setup to store for each candidate galaxy
         mjd_list, flux_list, flux_err_list = [], [], []
@@ -508,7 +535,7 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
                 data = hdul[1].data
                 header = hdul[1].header
 
-                # Placeholder pixel coordinates for now
+                # Placeholder pixel coordinates for now; which ones to use?
                 position = [(40, 40)]
 
                 # Simple circular aperture
@@ -541,6 +568,8 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
         mjd_all.append(mjd_list)
         flux_all.append(flux_list)
         flux_err_all.append(flux_err_list)
+        print("done.")
+
 
     # Add as nested columns
     df_candidates["mjd_obs"] = mjd_all
@@ -820,7 +849,7 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
     cutouts, mjd_list = [], []
 
     # Loop over all image filenames and generate cutouts
-    for fname in image_filenames:
+    for fname in image_filenames[:10]:  # limit to first 10 images for speed; fix later
         cutout = make_cutout(fname, ra, dec, size=size)
         if cutout is not None:
             cutouts.append(cutout.data)
