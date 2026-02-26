@@ -943,7 +943,7 @@ def select_images_by_mjd_quantiles(image_filenames, all_mjds, n_select=9):
 # galaxy_id of my favorite candidate
 favorite = 10306000022321
 
-single_gal = df[df["galaxy_id"] == favorite]
+single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
@@ -952,8 +952,8 @@ selected_filenames = select_images_by_mjd_quantiles(
 
 cutout_gallery(
     image_filenames=selected_filenames,
-    ra= single_gal["ra"].iloc[0],
-    dec=single_gal["dec"].iloc[0],
+    ra=single_gal["ra"],
+    dec=single_gal["dec"],
     size=100,
     ncols=3,
     galaxy_id=favorite,
