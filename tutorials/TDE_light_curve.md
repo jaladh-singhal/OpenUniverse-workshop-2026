@@ -896,6 +896,50 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
 ```
 
 ```{code-cell} ipython3
+---
+jupyter:
+  source_hidden: true
+---
+def select_images_by_mjd_quantiles(image_filenames, all_mjds, n_select=9):
+    """
+    Select up to `n_select` images using rank-quantiles of each image's observation MJD.
+
+    Parameters
+    ----------
+    image_filenames : list of str
+        List of FITS image paths.
+    all_mjds : list-like
+        MJD values aligned with ``image_filenames`` in shape.
+    n_select : int, optional
+        Maximum number of images to select. Default is 9.
+
+    Returns
+    -------
+    list of str
+        Selected filenames ordered in increasing MJD.
+        Falls back to the first n_select files if no finite MJD values exist.
+    """
+    fname_mjd = [] # list of (fname, mjd) tuples for valid entries
+    for fname, mjd in zip(image_filenames, all_mjds):
+        try:
+            mjd_value = float(mjd)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(mjd_value):
+            fname_mjd.append((fname, mjd_value))
+
+    if not fname_mjd:
+        return image_filenames[:n_select]
+
+    fname_mjd.sort(key=lambda x: x[1]) # sort by MJD
+    num_quantiles = min(n_select, len(fname_mjd))
+    quantile_indices = np.rint( # round off to nearest integer
+        np.linspace(0, len(fname_mjd) - 1, num_quantiles)
+    ).astype(int)
+    return [fname_mjd[i][0] for i in quantile_indices]
+```
+
+```{code-cell} ipython3
 # galaxy_id of my favorite candidate
 favorite = 10306000022321
 
@@ -903,9 +947,12 @@ single_gal = df[df["galaxy_id"] == favorite]
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
+selected_filenames = select_images_by_mjd_quantiles(
+    single_gal["image_filenames"], single_gal["mjd_obs"], n_select=9)
+
 cutout_gallery(
-    image_filenames=single_gal["image_filenames"].iloc[0],
-    ra=single_gal["ra"].iloc[0],
+    image_filenames=selected_filenames,
+    ra= single_gal["ra"].iloc[0],
     dec=single_gal["dec"].iloc[0],
     size=100,
     ncols=3,
