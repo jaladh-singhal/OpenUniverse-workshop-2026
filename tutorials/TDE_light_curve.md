@@ -61,7 +61,7 @@ import numpy as np
 import s3fs
 from matplotlib import pyplot as plt
 import pandas as pd
-from photutils.aperture import CircularAperture, aperture_photometry
+from photutils.aperture import SkyCircularAperture, aperture_photometry
 from scipy.ndimage import rotate
 from astropy import units as u
 from astropy.coordinates import SkyCoord
@@ -491,7 +491,7 @@ This section demonstrates how to extract and visualize a light curve for a poten
 jupyter:
   source_hidden: true
 ---
-def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
+def run_aperture_photometry(df_candidates, bandname, aperture_radius=1.0):
     """
     Perform circular aperture photometry on a list of FITS images.
 
@@ -503,19 +503,19 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
     bandname : string
         Bandname for which to do photometry.
     aperture_radius : float, optional
-        Aperture radius in pixels. Default is 3.0.
+        Aperture radius in arcsec. Default is 1.0 for simplification.
 
     Returns
     -------
     phot_df : pandas.DataFrame
         DataFrame containing the photometry results with columns:
         ['RA', 'Dec', 'mjd_obs', 'filename', 'flux', 'flux_err',
-         'aperture_radius', 'background']
+         'aperture_radius_pix', 'background']
     """
 
     #store photometry for all rows in the dataframe
     #these will be lists of lists
-    mjd_all, flux_all, flux_err_all = [], [], []
+    mjd_all, flux_all, flux_err_all, aperture_radius_pix_all = [], [], [], []
 
     #for each candidate galaxy:
     for idx, row in df_candidates.iterrows():
@@ -525,7 +525,7 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
 
 
         #setup to store for each candidate galaxy
-        mjd_list, flux_list, flux_err_list = [], [], []
+        mjd_list, flux_list, flux_err_list, aperture_radius_pix_list = [], [], [], []
 
 
         for fname in filenames:
@@ -535,14 +535,16 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
                 data = hdul[1].data
                 header = hdul[1].header
 
-                # Placeholder pixel coordinates for now; which ones to use?
-                position = [(40, 40)]
+                # Build a WCS object so photutils can convert between sky and pixel coordinates.
+                wcs = WCS(header)
 
-                # Simple circular aperture
-                aperture = CircularAperture(position, r=aperture_radius)
+                # Simple circular aperture centered on the candidate galaxy position
+                sky_position = SkyCoord(row["ra"], row["dec"], unit="deg", frame="icrs")
+                aperture = SkyCircularAperture(sky_position, r=aperture_radius * u.arcsec)
+                pixel_aperture = aperture.to_pixel(wcs)
 
                 # Perform aperture photometry
-                phot_table = aperture_photometry(data, aperture)
+                phot_table = aperture_photometry(data, aperture, wcs=wcs)
 
                 # Check output (optional)
                 #print(phot_table)
@@ -551,23 +553,26 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
                 background = np.nanmedian(data)
 
                 # Subtract background from aperture sum
-                flux = phot_table['aperture_sum'][0] - background * np.pi * aperture_radius**2
+                aperture_area = pixel_aperture.area
+                flux = phot_table['aperture_sum'][0] - background * aperture_area
 
                 # Approximate uncertainty from background rms
-                flux_err = np.nanstd(data) * np.sqrt(np.pi * aperture_radius**2)
+                flux_err = np.nanstd(data) * np.sqrt(aperture_area)
 
                 # Observation mid-time from MJD-OBS
                 mjd_obs = header.get('MJD-OBS', None)
 
-                #store info
+                #store related info
                 mjd_list.append(mjd_obs)
                 flux_list.append(flux)
                 flux_err_list.append(flux_err)
+                aperture_radius_pix_list.append(float(pixel_aperture.r))
 
 
         mjd_all.append(mjd_list)
         flux_all.append(flux_list)
         flux_err_all.append(flux_err_list)
+        aperture_radius_pix_all.append(aperture_radius_pix_list)
         print("done.")
 
 
@@ -575,12 +580,13 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
     df_candidates["mjd_obs"] = mjd_all
     df_candidates[f"flux_{bandname}"] = flux_all
     df_candidates[f"flux_err_{bandname}"] = flux_err_all
+    df_candidates["aperture_radius_pix"] = aperture_radius_pix_all
 
     return df_candidates
 ```
 
 ```{code-cell} ipython3
-df = run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0)
+df = run_aperture_photometry(df_candidates, bandname)
 ```
 
 ```{code-cell} ipython3
@@ -805,12 +811,8 @@ def make_cutout(fname, ra, dec, size=100):
 
         rot_wcs = WCS(header)
 
-        #fudge the build cutout for now since we don't have RA and Dec of our sources worked out yet
-        position = (40, 40)
-        cutout = Cutout2D(img, position, size, mode="partial")
-
-        # Build cutout  (real version)
-        #cutout = Cutout2D(rot_img, coord, size, wcs=rot_wcs, mode="partial")
+        # Build cutout
+        cutout = Cutout2D(rot_img, coord, size, wcs=rot_wcs, mode="partial")
 
         return cutout
 ```
@@ -820,7 +822,7 @@ def make_cutout(fname, ra, dec, size=100):
 jupyter:
   source_hidden: true
 ---
-def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
+def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list, size=100, ncols=4,
                    galaxy_id=None, superevent_id=None):
     """
     Display a gallery of cutouts centered on (RA, Dec) for a list of Roman TDS images.
@@ -829,8 +831,12 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
     ----------
     image_filenames : list of str
         List of S3 image filenames.
+    mjd_list : list-like
+        Observation MJD values aligned with `image_filenames`.
     ra, dec : float
         Target coordinates in degrees.
+    aperture_radius_pix_list : list of float
+        Aperture radius values in pixels, aligned with `image_filenames`.
     size : int or float, optional
         Cutout size in pixels. Default = 100.
     ncols : int, optional
@@ -845,17 +851,16 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
     fig : matplotlib.figure.Figure
         The displayed figure object.
     """
-    # Initialize lists to store image cutouts and observation times
-    cutouts, mjd_list = [], []
+    # Initialize lists to store image cutouts, observation times, and aligned pixel radii.
+    cutouts, mjds, radii_pix = [], [], []
 
-    # Loop over all image filenames and generate cutouts
-    for fname in image_filenames[:10]:  # limit to first 10 images for speed; fix later
+    # Loop over all image filenames and generate cutouts and only keep MJDs and pixel radii for those with valid cutouts
+    for fname, mjd, radius_pix in zip(image_filenames, mjd_list, aperture_radius_pix_list):
         cutout = make_cutout(fname, ra, dec, size=size)
         if cutout is not None:
-            cutouts.append(cutout.data)
-            # Open FITS header to extract observation time (MJD)
-            with fits.open(f"s3://{fname}", fsspec_kwargs={"anon": True}, memmap=False) as hdu:
-                mjd_list.append(hdu[1].header.get("MJD-OBS", np.nan))
+            cutouts.append(cutout)
+            mjds.append(mjd)
+            radii_pix.append(radius_pix)
 
     # Stop if no valid cutouts were created
     if not cutouts:
@@ -880,9 +885,18 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
         )
 
     # Display each cutout image with contrast scaling and MJD label
-    for ax, img, mjd, fname in zip(axes, cutouts, mjd_list, image_filenames):
+    for ax, cutout, mjd, radius_pix in zip(axes, cutouts, mjds, radii_pix):
+        img = cutout.data
         vmin, vmax = np.nanpercentile(img, [5, 99])
         ax.imshow(img, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+        # Draw the aperture circle in the cutout
+        sky_center = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+        x_center, y_center = cutout.wcs.world_to_pixel(sky_center)
+        if np.isfinite(radius_pix) and radius_pix > 0:
+            aperture_circle = plt.Circle((x_center, y_center), radius_pix,
+                                         edgecolor="cyan", facecolor="none", linewidth=1.3)
+            ax.add_patch(aperture_circle)
+
         ax.set_title(f"MJD {mjd:.2f}", fontsize=8)
         ax.axis("off")
 
@@ -900,7 +914,7 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
 jupyter:
   source_hidden: true
 ---
-def select_images_by_mjd_quantiles(image_filenames, all_mjds, n_select=9):
+def select_images_by_mjd_quantiles(image_filenames, all_mjds, aperture_radius_pix=None, n_select=9):
     """
     Select up to `n_select` images using rank-quantiles of each image's observation MJD.
 
@@ -910,33 +924,46 @@ def select_images_by_mjd_quantiles(image_filenames, all_mjds, n_select=9):
         List of FITS image paths.
     all_mjds : list-like
         MJD values aligned with ``image_filenames`` in shape.
+    aperture_radius_pix : list-like, optional
+        Per-image aperture radii in pixels, aligned with ``image_filenames``.
     n_select : int, optional
         Maximum number of images to select. Default is 9.
 
     Returns
     -------
-    list of str
-        Selected filenames ordered in increasing MJD.
-        Falls back to the first n_select files if no finite MJD values exist.
+    tuple
+        (`selected_filenames`, `selected_mjds`, `selected_aperture_radius_pix`) ordered in increasing MJD.
+        Falls back to first n_select entries if no finite MJD values exist.
     """
-    fname_mjd = [] # list of (fname, mjd) tuples for valid entries
-    for fname, mjd in zip(image_filenames, all_mjds):
+    if aperture_radius_pix is None:
+        aperture_radius_pix = [np.nan] * len(image_filenames)
+
+    fname_mjd_r = [] # list of (fname, mjd, radius_pix) tuples for valid entries
+    for fname, mjd, radius_pix in zip(image_filenames, all_mjds, aperture_radius_pix):
         try:
             mjd_value = float(mjd)
         except (TypeError, ValueError):
             continue
         if np.isfinite(mjd_value):
-            fname_mjd.append((fname, mjd_value))
+            fname_mjd_r.append((fname, mjd_value, radius_pix))
 
-    if not fname_mjd:
-        return image_filenames[:n_select]
+    if not fname_mjd_r:
+        return (
+            image_filenames[:n_select],
+            list(all_mjds[:n_select]),
+            list(aperture_radius_pix[:n_select]),
+        )
 
-    fname_mjd.sort(key=lambda x: x[1]) # sort by MJD
-    num_quantiles = min(n_select, len(fname_mjd))
+    fname_mjd_r.sort(key=lambda x: x[1]) # sort by MJD
+    num_quantiles = min(n_select, len(fname_mjd_r))
     quantile_indices = np.rint( # round off to nearest integer
-        np.linspace(0, len(fname_mjd) - 1, num_quantiles)
+        np.linspace(0, len(fname_mjd_r) - 1, num_quantiles)
     ).astype(int)
-    return [fname_mjd[i][0] for i in quantile_indices]
+    selected = [fname_mjd_r[i] for i in quantile_indices]
+    selected_filenames = [entry[0] for entry in selected]
+    selected_mjds = [entry[1] for entry in selected]
+    selected_radius_pix = [entry[2] for entry in selected]
+    return selected_filenames, selected_mjds, selected_radius_pix
 ```
 
 ```{code-cell} ipython3
@@ -947,13 +974,19 @@ single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
-selected_filenames = select_images_by_mjd_quantiles(
-    single_gal["image_filenames"], single_gal["mjd_obs"], n_select=9)
+selected_filenames, selected_mjds, selected_radius_pix = select_images_by_mjd_quantiles(
+    single_gal["image_filenames"],
+    single_gal["mjd_obs"],
+    aperture_radius_pix=single_gal["aperture_radius_pix"],
+    n_select=9
+)
 
 cutout_gallery(
     image_filenames=selected_filenames,
+    mjd_list=selected_mjds,
     ra=single_gal["ra"],
     dec=single_gal["dec"],
+    aperture_radius_pix_list=selected_radius_pix,
     size=100,
     ncols=3,
     galaxy_id=favorite,
