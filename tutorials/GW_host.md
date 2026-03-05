@@ -4,7 +4,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.17.3
+    jupytext_version: 1.19.1
 kernelspec:
   name: python3
   display_name: python3
@@ -26,7 +26,9 @@ By the end of this tutorial, you will be able to :
 
 The [OpenUniverse2024]((https://arxiv.org/abs/2501.05632)) simulation suite delivers ~70 deg² of matched optical/infrared imagery designed for both the LSST Wide‑Fast‑Deep (WFD) and the Nancy Grace Roman Space Telescope high-latitude survey, enabling joint survey planning and multi-wavelength systematics studies. It incorporates the updated “Diffsky” extragalactic model, extended transient modeling across optical/IR wavelengths, and realistic telescope/instrument effects, producing roughly 400 TB of publicly available synthetic imaging and catalogs. The goal of this project is to enable cross-collaboration and maximize science return from next-generation cosmological surveys by providing a consistent simulated sky observed by multiple observatories.
 
-Gravitational wave (GW) detections open a new window on the universe, but identifying the galaxies that host these events remains a key challenge. This notebook explores potential GW host galaxies using simulated data from the OpenUniverse2024 Roman and Rubin surveys. The goal is to demonstrate how users can locate candidate host galaxies associated with GW alerts, extract their optical and infrared photometry, and analyze their time evolution in both the optical and infrared. This workflow enables multiwavelength characterization to help rapidly identify transient host galaxies.
+Tidal Disruption Events (TDEs) occur when a star passes close enough to a supermassive black hole to be torn apart by tidal forces, producing a luminous flare that can outshine the host galaxy for weeks to months.
+Identifying and characterizing TDE host galaxies is key to understanding the demographics of supermassive black holes and the galactic environments that produce these rare events.
+This notebook demonstrates how to locate a simulated TDE from the OpenUniverse2024 transient input catalog, identify its host galaxy, and extract optical and infrared photometry from Roman and Rubin images to construct a multi-epoch light curve.
 
 ### Instructions
 
@@ -50,7 +52,7 @@ starttime = time.time()
 
 ```{code-cell} ipython3
 # Uncomment the next line to install dependencies if needed.
-# !pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow astropy-healpix
+!pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow astropy-healpix
 ```
 
 ```{code-cell} ipython3
@@ -130,59 +132,7 @@ This output lists the structure and contents of one example Roman TDS FITS image
 
 +++
 
-### 1.1 How are these fits files organized?
-Look at all the files of one of the end directories.
-Print out a relevant table of header keywords so we can see if these are all at the same position (time series) or at different positions.
-
-```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def summarize_fits_files(files):
-    """
-    Summarize FITS files by listing key metadata for each.
-
-    Parameters
-    ----------
-    files : list of str
-        List of S3 URIs or file paths to FITS files.
-
-    Returns
-    -------
-    list of tuple
-        Each tuple contains:
-        (filename, RA, DEC, MJD-OBS, pixel_scale_arcsec)
-    """
-    results = []
-
-    for f in files:
-        fname = f.split("/")[-1]
-
-        # Read only the header from extension 1 (much faster than opening full HDU)
-        hdr = fits.getheader(f, ext=1, fsspec_kwargs={"anon": True})
-
-        # Extract pointing and time info
-        ra = hdr.get("RA", hdr.get("CRVAL1"))
-        dec = hdr.get("DEC", hdr.get("CRVAL2"))
-        mjd = hdr.get("MJD-OBS")
-
-        results.append((fname, ra, dec, mjd))
-
-    # Formatted printout
-    print(f"{'File':40s} {'RA':>12s} {'DEC':>12s} {'MJD-OBS':>12s} ")
-    for fname,  ra, dec, mjd in results:
-        print(f"{fname:40s} {ra:12.5f} {dec:12.5f} {mjd:12.5f}")
-
-    return results
-```
-
-```{code-cell} ipython3
-fits_summary = summarize_fits_files(files)
-```
-
-We can see from this summary that the images are all at different positions taken at the same time.
-Next, Let's take a look at a few images to see what we are dealing with.
+Let's take a look at a few images to see what we are dealing with.
 
 ```{code-cell} ipython3
 ---
@@ -289,7 +239,7 @@ host_row = gal_info[gal_info["galaxy_id"] == tde_row["host_id"]].iloc[0]
 # Step 4: Set position variables (same interface used by Section 3)
 ra_center  = host_row["ra"] * u.deg
 dec_center = host_row["dec"] * u.deg
-radius_deg = 0.1 * u.deg
+radius_deg = 1 * u.arcsec
 
 print(f"TDE host galaxy: RA={ra_center:.4f}, Dec={dec_center:.4f}")
 print(f"Search radius: {radius_deg}")
