@@ -52,7 +52,7 @@ starttime = time.time()
 
 ```{code-cell} ipython3
 # Uncomment the next line to install dependencies if needed.
-!pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow astropy-healpix
+# !pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow astropy-healpix
 ```
 
 ```{code-cell} ipython3
@@ -251,7 +251,9 @@ To locate data covering the region identified by the TDE target, we begin by per
 +++
 
 ### 3.1 Catalog access
-We use the "roman_rubin_cats_v1.1.2_faint" catalog (defined above as CATALOG_NAME) because it provides precise sky positions and unique galaxy IDs for all simulated Roman + Rubin sources, allowing us to later cross-match these galaxies with other derived quantities such as photometry or physical parameters. We select the full survey rather than the preview version because it covers a larger sky area and represents the more recent, higher-fidelity release of the OpenUniverse2024 simulations.  "faint" in the catalog name refers to the deeper magnitude limit of the simulation.
+We use the "roman_rubin_cats_v1.1.2_faint" catalog (defined above as CATALOG_NAME) because it provides precise sky positions and unique galaxy IDs for all simulated Roman + Rubin sources, allowing us to later cross-match these galaxies with other derived quantities such as photometry or physical parameters.
+We select the full survey rather than the preview version because it covers a larger sky area and represents the more recent, higher-fidelity release of the OpenUniverse2024 simulations.
+"faint" in the catalog name refers to the deeper magnitude limit of the simulation.
 
 ```{code-cell} ipython3
 ---
@@ -347,66 +349,15 @@ def cone_search_catalog(
 ```
 
 ```{code-cell} ipython3
-df_all_candidates = cone_search_catalog(ra_center,dec_center,radius_deg)
+df_candidates = cone_search_catalog(ra_center,dec_center,radius_deg)
 ```
 
 ```{code-cell} ipython3
 # Take a look at what we have in the dataframe of candidates.
-# Note: we have restricted the columns we keep in our dataframe to decrease runtime.
-df_all_candidates
-```
-
-### 3.2 Filter candidate list
-This is an unreasonably large number of galaxies so we need to find a way to filter that list to save only the most likely candidates.  To help with this filtering, we store all of the available, value-added, columns from OpenUniverse in the candidate dataframe.  We will make some rough cuts on magnitude to allow follow-up, but then just select randomly a few galaxies to continue on with.
-
-```{code-cell} ipython3
-#list the available columns so users can make their own filters
-df_all_candidates.columns
-```
-
-```{code-cell} ipython3
-#look at ranges of the redshift and fluxes reported
-cols = [
-    "redshift",
-    "lsst_flux_u", "lsst_flux_g", "lsst_flux_r", "lsst_flux_i",
-    "lsst_flux_z", "lsst_flux_y",
-    "roman_flux_W146", "roman_flux_R062", "roman_flux_Z087",
-    "roman_flux_Y106", "roman_flux_J129", "roman_flux_H158",
-    "roman_flux_F184", "roman_flux_K213"
-]
-
-df_all_candidates[cols].describe()
-```
-
-```{code-cell} ipython3
-#make reasonable choices for filtering the candidates
-
-#TDE host galaxies are typically at low redshift
-mask_z = df_all_candidates["redshift"] < 0.3
-
-# keep only galaxies with less noisy fluxes in Roman W146 or LSST i
-mask_flux = (
-    (df_all_candidates["roman_flux_W146"] > 1e-5) |
-    (df_all_candidates["lsst_flux_i"] > 1e-6)
-)
-
-df_candidates = df_all_candidates[mask_z & mask_flux].copy()
-print(f"Reduced from {len(df_all_candidates)} → {len(df_candidates)} candidates")
-```
-
-```{code-cell} ipython3
-# Make unreasonable, yet practical, choices for filtering the candidates
-# Doing a rigorous filtering on the remaining candidates is beyond the scope of this tutorial, but we
-# need to reduce the number of candidates to show the next steps in a reasonable amount of time.
-df_candidates = df_candidates[:4]
-
-#and here they are! our top 4 candidates
-#for the purposes of this tutorial we keep this number small
-#in the limit of inifinte time and resources, you can make your candidate list as long as you like
 df_candidates
 ```
 
-### 3.3 Image access
+### 3.2 Image access
 Now we need to find the filenames of the images in the TDS survey which include these targets
 
 ```{code-cell} ipython3
