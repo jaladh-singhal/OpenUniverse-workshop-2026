@@ -4,7 +4,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.17.3
+    jupytext_version: 1.19.1
 kernelspec:
   name: python3
   display_name: python3
@@ -26,7 +26,9 @@ By the end of this tutorial, you will be able to :
 
 The [OpenUniverse2024]((https://arxiv.org/abs/2501.05632)) simulation suite delivers ~70 deg² of matched optical/infrared imagery designed for both the LSST Wide‑Fast‑Deep (WFD) and the Nancy Grace Roman Space Telescope high-latitude survey, enabling joint survey planning and multi-wavelength systematics studies. It incorporates the updated “Diffsky” extragalactic model, extended transient modeling across optical/IR wavelengths, and realistic telescope/instrument effects, producing roughly 400 TB of publicly available synthetic imaging and catalogs. The goal of this project is to enable cross-collaboration and maximize science return from next-generation cosmological surveys by providing a consistent simulated sky observed by multiple observatories.
 
-Gravitational wave (GW) detections open a new window on the universe, but identifying the galaxies that host these events remains a key challenge. This notebook explores potential GW host galaxies using simulated data from the OpenUniverse2024 Roman and Rubin surveys. The goal is to demonstrate how users can locate candidate host galaxies associated with GW alerts, extract their optical and infrared photometry, and analyze their time evolution in both the optical and infrared. This workflow enables multiwavelength characterization to help rapidly identify transient host galaxies.
+Tidal Disruption Events (TDEs) occur when a star passes close enough to a supermassive black hole to be torn apart by tidal forces, producing a luminous flare that can outshine the host galaxy for weeks to months.
+Identifying and characterizing TDE host galaxies is key to understanding the demographics of supermassive black holes and the galactic environments that produce these rare events.
+This notebook demonstrates how to locate a simulated TDE from the OpenUniverse2024 transient input catalog, identify its host galaxy, and extract optical and infrared photometry from Roman and Rubin images to construct a multi-epoch light curve.
 
 ### Instructions
 
@@ -65,15 +67,13 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.nddata import Cutout2D
 from astropy.wcs import WCS
-from astropy.table import Table
 import astropy_healpix as ah
 import pyarrow.dataset as ds
+import pyarrow.fs
+import pyarrow.parquet as pq
+import json
 
 import itertools
-
-from base64 import b64decode
-from io import BytesIO
-import json
 ```
 
 ## 1. Explore the OpenUniverse2024 data directories
@@ -133,59 +133,7 @@ This output lists the structure and contents of one example Roman TDS FITS image
 
 +++
 
-### 1.1 How are these fits files organized?
-Look at all the files of one of the end directories.
-Print out a relevant table of header keywords so we can see if these are all at the same position (time series) or at different positions.
-
-```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def summarize_fits_files(files):
-    """
-    Summarize FITS files by listing key metadata for each.
-
-    Parameters
-    ----------
-    files : list of str
-        List of S3 URIs or file paths to FITS files.
-
-    Returns
-    -------
-    list of tuple
-        Each tuple contains:
-        (filename, RA, DEC, MJD-OBS, pixel_scale_arcsec)
-    """
-    results = []
-
-    for f in files:
-        fname = f.split("/")[-1]
-
-        # Read only the header from extension 1 (much faster than opening full HDU)
-        hdr = fits.getheader(f, ext=1, fsspec_kwargs={"anon": True})
-
-        # Extract pointing and time info
-        ra = hdr.get("RA", hdr.get("CRVAL1"))
-        dec = hdr.get("DEC", hdr.get("CRVAL2"))
-        mjd = hdr.get("MJD-OBS")
-
-        results.append((fname, ra, dec, mjd))
-
-    # Formatted printout
-    print(f"{'File':40s} {'RA':>12s} {'DEC':>12s} {'MJD-OBS':>12s} ")
-    for fname,  ra, dec, mjd in results:
-        print(f"{fname:40s} {ra:12.5f} {dec:12.5f} {mjd:12.5f}")
-
-    return results
-```
-
-```{code-cell} ipython3
-fits_summary = summarize_fits_files(files)
-```
-
-We can see from this summary that the images are all at different positions taken at the same time.
-Next, Let's take a look at a few images to see what we are dealing with.
+Let's take a look at a few images to see what we are dealing with.
 
 ```{code-cell} ipython3
 ---
@@ -247,136 +195,71 @@ yup, definitely different positions!
 
 +++
 
-## 2. Find a position from a GW host trigger
-Let's assume we have a GW alert and want to generate preview light curves of the most likely host galaxies using Roman and Rubin imaging.  We first need to take the alert and figure out a likely position plus error ellipse for the potential host galaxies.
+## 2. Find a TDE target from the transient catalog
+
+We use the OpenUniverse2024 transient input catalog — the same SNANA parquet files described in the [SED Fitting tutorial](sed_fit) — to find a TDE.
+The catalog stores one parquet file per HEALPix region, and TDEs are rare, so not every region will contain one.
+We iterate over regions in sorted order and stop at the first TDE we find, using its host galaxy sky position as our search center for the sections that follow.
+
+First, we connect to S3 and list all available SNANA parquet files in the catalog.
 
 ```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def GW_derive_position(record):
-    """
-    Parse a GCN Kafka notice for an LVK gravitational-wave (GW) event,
-    decode the embedded sky map, and compute the most probable sky
-    location and 90% credible area.
+fs = pyarrow.fs.S3FileSystem(anonymous=True)
+catalog_prefix = f"{BUCKET_NAME}/{OU_PREFIX}/roman/full/{CATALOG_NAME}"
 
-    Parameters
-    ----------
-    record : str
-        JSON-formatted Kafka record (string) received from a GCN stream.
+file_info = fs.get_file_info(pyarrow.fs.FileSelector(catalog_prefix, recursive=False))
+snana_files = sorted([
+    f.path for f in file_info
+    if f.base_name.startswith("snana_") and f.base_name.endswith(".parquet")
+])
 
-    Returns
-    -------
-    result : dict or None
-        Dictionary containing parsed event information with keys:
-            - 'superevent_id' : str
-                Unique identifier of the GW superevent.
-            - 'ra' : float
-                Right Ascension of the most probable sky location (deg).
-            - 'dec' : float
-                Declination of the most probable sky location (deg).
-            - 'area_90_deg2' : float
-                Sky area of the 90% credible region (deg²).
-            - 'equivalent_radius': float
-                assuming circular area_90_deg2  (deg).
-            - 'dist_mean' : float
-                Mean luminosity distance (Mpc).
-            - 'dist_std' : float
-                Standard deviation of the luminosity distance (Mpc).
-        Returns ``None`` if the record does not contain a valid skymap
-        or is not a CBC-type gravitational-wave event.
-    """
-    record = json.loads(record)
-
-    # --- Filter out irrelevant events ---
-    superevent_id = record.get("superevent_id", "")
-    if not superevent_id or superevent_id[0] not in ["M", "S"]:
-        return None
-    if record.get("alert_type") == "RETRACTION":
-        print(f"{superevent_id} was retracted.")
-        return None
-    if record.get("event", {}).get("group") != "CBC":
-        return None
-
-    # --- Decode sky map ---
-    skymap_str = record.get("event", {}).pop("skymap", None)
-    if not skymap_str:
-        print("No skymap found in record.")
-        return None
-
-    skymap_bytes = b64decode(skymap_str)
-    skymap = Table.read(BytesIO(skymap_bytes))
-
-    # --- Find most probable sky location ---
-    max_idx = np.argmax(skymap["PROBDENSITY"])
-    level, ipix = ah.uniq_to_level_ipix(skymap[max_idx]["UNIQ"])
-    ra, dec = ah.healpix_to_lonlat(ipix, ah.level_to_nside(level), order="nested")
-
-    # --- Compute 90% credible area ---
-    probdensity = skymap["PROBDENSITY"]
-    sorted_idx = np.argsort(probdensity)[::-1]
-    sorted_probs = probdensity[sorted_idx]
-
-    level_sorted, ipix_sorted = ah.uniq_to_level_ipix(skymap["UNIQ"][sorted_idx])
-    nside_sorted = ah.level_to_nside(level_sorted)
-    pix_area_sr = ah.nside_to_pixel_area(nside_sorted)
-
-    prob_per_pix = sorted_probs * pix_area_sr.value
-    cumprob = np.cumsum(prob_per_pix)
-    mask_90 = cumprob <= 0.9
-    area_90 = np.sum(pix_area_sr[mask_90]).to(u.deg**2)
-
-    # --- Print key results ---
-    print(f"Superevent: {superevent_id}")
-    print(f"Most probable sky location (RA, Dec) = ({ra.deg:.3f}, {dec.deg:.3f}) deg")
-    print(f"90% credible region area = {area_90:.2f}")
-    print(f"Distance = {skymap.meta['DISTMEAN']} ± {skymap.meta['DISTSTD']} Mpc")
-
-    # --- Package results in a dict ---
-    result = {
-        "superevent_id": superevent_id,
-        "ra": ra,                       # Quantity (deg)
-        "dec": dec,                     # Quantity (deg)
-        "area_90": area_90,             # Quantity (deg^2)
-        # use an extemeley simplifying assumption that the area is circluar
-        # this is almost certainly not the case
-        # but this tutorial is not about healpix gymnastics so lets just get something useful
-        "equivalent_radius": np.sqrt(area_90 / np.pi),  # Quantity (deg)
-        "dist_mean": skymap.meta["DISTMEAN"]* u.Mpc,
-        "dist_std": skymap.meta["DISTSTD"]* u.Mpc,
-    }
-
-    return result
+print(f"Found {len(snana_files)} snana parquet files")
 ```
 
+Next, we scan those files in order, reading each one until we find a row with `model_name == "NON1ASED.TDE-BBFIT"`.
+We record the first TDE found and the region it came from, then stop.
+
 ```{code-cell} ipython3
-# Read the file and then parse it into values we need
-with open('MS181101ab-preliminary.json', 'r') as f:
-    record = f.read()
+tde_row = None
+tde_region = None
+for path in snana_files:
+    df = pq.read_table(path, filesystem=fs).to_pandas()
+    mask = df["model_name"] == "NON1ASED.TDE-BBFIT"
+    if mask.any():
+        tde_row = df[mask].iloc[0]
+        # extract region index from filename (e.g. "snana_9921.parquet" → "9921")
+        tde_region = path.split("snana_")[1].replace(".parquet", "")
+        print(f"Found TDE in region {tde_region}")
+        break
 
-result = GW_derive_position(record)
-
-#setup for next section
-ra_center  = result["ra"]
-dec_center = result["dec"]
-radius_deg = result["equivalent_radius"]
+if tde_row is None:
+    raise RuntimeError("No TDE found in any snana parquet file.")
 ```
 
+Once we have the TDE, we load the corresponding galaxy info parquet file for that region to look up the host galaxy's sky coordinates, and set the position variables used by Section 3.
+
 ```{code-cell} ipython3
-#faking this for now with a region I know is included in the catalogs and images
-ra_center=8.18055859478308 * u.deg
-dec_center=-42.97480996920524 * u.deg
-radius_deg = 0.1 * u.deg
+galaxy_info_file = f"{catalog_prefix}/galaxy_{tde_region}.parquet"
+gal_info = pq.read_table(galaxy_info_file, filesystem=fs).to_pandas()
+host_row = gal_info[gal_info["galaxy_id"] == tde_row["host_id"]].iloc[0]
+
+ra_center  = host_row["ra"] * u.deg
+dec_center = host_row["dec"] * u.deg
+radius_deg = 1 * u.arcsec
+
+print(f"TDE host galaxy: RA={ra_center:.4f}, Dec={dec_center:.4f}")
+print(f"Search radius: {radius_deg}")
 ```
 
 ## 3. Data Access
-To locate data covering the region identified by the GW alert, we begin by performing a cone search in the existing OpenUniverse2024 Roman + Rubin catalogs. This step identifies all known galaxies within the sky area defined by the alert’s position and radius. The resulting catalog provides positions and IDs for each potential host galaxy.  With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
+To locate data covering the region identified by the TDE target, we begin by performing a cone search in the existing OpenUniverse2024 Roman + Rubin catalogs. This step identifies all known galaxies within some small radius of the TDE position identified above. The resulting catalog provides positions and IDs for each potential host galaxy.  With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
 
 +++
 
 ### 3.1 Catalog access
-We use the "roman_rubin_cats_v1.1.2_faint" catalog (defined above as CATALOG_NAME) because it provides precise sky positions and unique galaxy IDs for all simulated Roman + Rubin sources, allowing us to later cross-match these galaxies with other derived quantities such as photometry or physical parameters. We select the full survey rather than the preview version because it covers a larger sky area and represents the more recent, higher-fidelity release of the OpenUniverse2024 simulations.  "faint" in the catalog name refers to the deeper magnitude limit of the simulation.
+We use the "roman_rubin_cats_v1.1.2_faint" catalog (defined above as CATALOG_NAME) because it provides precise sky positions and unique galaxy IDs for all simulated Roman + Rubin sources, allowing us to later cross-match these galaxies with other derived quantities such as photometry or physical parameters.
+We select the full survey rather than the preview version because it covers a larger sky area and represents the more recent, higher-fidelity release of the OpenUniverse2024 simulations.
+"faint" in the catalog name refers to the deeper magnitude limit of the simulation.
 
 ```{code-cell} ipython3
 ---
@@ -472,66 +355,15 @@ def cone_search_catalog(
 ```
 
 ```{code-cell} ipython3
-df_all_candidates = cone_search_catalog(ra_center,dec_center,radius_deg)
+df_candidates = cone_search_catalog(ra_center,dec_center,radius_deg)
 ```
 
 ```{code-cell} ipython3
 # Take a look at what we have in the dataframe of candidates.
-# Note: we have restricted the columns we keep in our dataframe to decrease runtime.
-df_all_candidates
-```
-
-### 3.2 Filter candidate list
-This is an unreasonably large number of galaxies so we need to find a way to filter that list to save only the most likely candidates.  To help with this filtering, we store all of the available, value-added, columns from OpenUniverse in the candidate dataframe.  We will make some rough cuts on magnitude to allow follow-up, but then just select randomly a few galaxies to continue on with.
-
-```{code-cell} ipython3
-#list the available columns so users can make their own filters
-df_all_candidates.columns
-```
-
-```{code-cell} ipython3
-#look at ranges of the redshift and fluxes reported
-cols = [
-    "redshift",
-    "lsst_flux_u", "lsst_flux_g", "lsst_flux_r", "lsst_flux_i",
-    "lsst_flux_z", "lsst_flux_y",
-    "roman_flux_W146", "roman_flux_R062", "roman_flux_Z087",
-    "roman_flux_Y106", "roman_flux_J129", "roman_flux_H158",
-    "roman_flux_F184", "roman_flux_K213"
-]
-
-df_all_candidates[cols].describe()
-```
-
-```{code-cell} ipython3
-#make reasonable choices for filtering the candidates
-
-#we don't exepect GW detections beyond about z~0.3
-mask_z = df_all_candidates["redshift"] < 0.3
-
-# keep only galaxies with less noisy fluxes in Roman W146 or LSST i
-mask_flux = (
-    (df_all_candidates["roman_flux_W146"] > 1e-5) |
-    (df_all_candidates["lsst_flux_i"] > 1e-6)
-)
-
-df_candidates = df_all_candidates[mask_z & mask_flux].copy()
-print(f"Reduced from {len(df_all_candidates)} → {len(df_candidates)} candidates")
-```
-
-```{code-cell} ipython3
-# Make unreasonable, yet practical, choices for filtering the candidates
-# Doing a rigorous filtering on the remaining candidates is beyond the scope of this tutorial, but we
-# need to reduce the number of candidates to show the next steps in a reasonable amount of time.
-df_candidates = df_candidates[:4]
-
-#and here they are! our top 4 candidates
-#for the purposes of this tutorial we keep this number small
-#in the limit of inifinte time and resources, you can make your candidate list as long as you like
 df_candidates
 ```
 
-### 3.3 Image access
+### 3.2 Image access
 Now we need to find the filenames of the images in the TDS survey which include these targets
 
 ```{code-cell} ipython3
@@ -1043,13 +875,12 @@ if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
 cutout_gallery(
-    image_filenames=single_gal["image_filenames"].iloc[0] ,
-    ra= single_gal["ra"].iloc[0],
+    image_filenames=single_gal["image_filenames"].iloc[0],
+    ra=single_gal["ra"].iloc[0],
     dec=single_gal["dec"].iloc[0],
     size=100,
     ncols=3,
     galaxy_id=favorite,
-    superevent_id=result["superevent_id"]
 )
 
 # You may get a `FITSFixedWarning` this is completely harmless and
