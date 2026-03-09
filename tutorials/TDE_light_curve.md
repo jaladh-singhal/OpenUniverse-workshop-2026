@@ -436,15 +436,14 @@ def TDS_image_search(ra_center, dec_center, radius_deg, bandname):
 jupyter:
   source_hidden: true
 ---
-def add_image_filenames(df_candidates, radius_deg, bandname):
+def get_TDS_images(df_candidates, radius_deg, bandname):
     """
-    For each galaxy candidate, use TDS_image_search() to find nearby images
-    and store results as a nested column inside `df_candidates`.
+    Get images from the Roman TDS dataset for each galaxy candidate.
 
     Parameters
     ----------
     df_candidates : pandas.DataFrame
-        Must include at least 'ra' and 'dec' columns.
+        Must include 'galaxy_id', 'ra', and 'dec' columns.
     radius_deg : float
         Search radius in degrees passed to TDS_image_search().
     bandname : string
@@ -452,34 +451,93 @@ def add_image_filenames(df_candidates, radius_deg, bandname):
 
     Returns
     -------
-    pandas.DataFrame
-        The same DataFrame that was passed in, now containing an added
-        column ``"image_filenames"``. Each entry of this column is a
-        list of strings with the S3 paths of overlapping TDS images.
+    dict
+        Dictionary where keys are galaxy IDs and values are image filename lists.
     """
-
-    # Store filenames for each candidate
-    filenames_all = []
-
+    image_map = {}
     for _, row in df_candidates.iterrows():
+        galaxy_id = row["galaxy_id"]
         ra, dec = row["ra"], row["dec"]
-        print(f"Accessing images in band={bandname} for candidate at RA={ra:.3f}, Dec={dec:.3f} ...", end="")
+        print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra:.3f}, Dec={dec:.3f} ...", end="")
         filenames = TDS_image_search(ra, dec, radius_deg, bandname)
         print(f"done. Found {len(filenames)} images.")
-        filenames_all.append(filenames)
+        image_map[galaxy_id] = filenames
 
-    df_candidates["image_filenames"] = filenames_all
-
-    return df_candidates
+    return image_map
 ```
 
 ```{code-cell} ipython3
 bandname = "J129"
-df_candidates = add_image_filenames(df_candidates, radius_deg.value, bandname)
+image_search_radius = 10 * u.arcsec # TODO: do even narrower? we just want images containing the candidate which should
+candidates_images = get_TDS_images(df_candidates, image_search_radius.deg, bandname)
+```
+
+Since there are ~700 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images to add in the candidates dataframe.
+
+```{code-cell} ipython3
+---
+jupyter:
+  source_hidden: true
+---
+def select_images_by_mjd_quantiles(image_filenames, n_select=10):
+    """
+    Select up to `n_select` filenames using rank-quantiles of observation MJD.
+
+    Parameters
+    ----------
+    image_filenames : list of str
+        List of FITS image paths.
+    n_select : int, optional
+        Maximum number of images to select. Default is 10.
+
+    Returns
+    -------
+    list of str
+        Selected filenames ordered in increasing MJD.
+        Falls back to the first n_select filenames if no finite MJD values exist.
+    """
+    fname_mjd = []  # list of (fname, mjd) tuples for valid entries
+    for fname in image_filenames:
+        try:
+            # DO NOT read time from header but from SIA results for quick sampling
+            hdr = fits.getheader(fname, ext=1, fsspec_kwargs={"anon": True})
+            # TODO: read MJD from SIA results instead of header for speed
+            mjd = hdr.get("MJD-OBS", np.nan)
+            mjd_value = float(mjd)
+        except Exception:
+            continue
+        if np.isfinite(mjd_value):
+            fname_mjd.append((fname, mjd_value))
+
+    if not fname_mjd:
+        return image_filenames[:n_select]
+
+    fname_mjd.sort(key=lambda x: x[1])  # sort by MJD
+    num_quantiles = min(n_select, len(fname_mjd))
+    quantile_indices = np.rint(  # round off to nearest integer
+        np.linspace(0, len(fname_mjd) - 1, num_quantiles)
+    ).astype(int)
+    print(f"Selected {len(quantile_indices)} out of {len(fname_mjd)} images.")
+    return [fname_mjd[i][0] for i in quantile_indices]
 ```
 
 ```{code-cell} ipython3
-#note our dataframe now contains a column with a list of filenames per candidate host galaxy
+image_filenames = []
+
+for _, row in df_candidates.iterrows():
+    print(f"Reading MJD of each TDS image for galaxy_id={row['galaxy_id']} to pick a representative sample...")
+    selected_images = select_images_by_mjd_quantiles(candidates_images.get(row["galaxy_id"], []), n_select=10)
+    print(f"Selected {len(selected_images)}/{len(candidates_images[row['galaxy_id']])} images.\n")
+
+    # Replace above with the following for the full list of images for each candidate
+    # selected_images = candidates_images.get(row["galaxy_id"], [])
+    image_filenames.append(selected_images)
+
+df_candidates["image_filenames"] = image_filenames
+```
+
+```{code-cell} ipython3
+# check if we have a nested column of image filenames for each candidate
 df_candidates
 ```
 
@@ -491,17 +549,20 @@ This section demonstrates how to extract and visualize a light curve for a poten
 jupyter:
   source_hidden: true
 ---
-def run_aperture_photometry(df_candidates, bandname, aperture_radius=1.0):
+def run_aperture_photometry(df_candidates, bandname, image_column="image_filenames_sampled", aperture_radius=1.0):
     """
     Perform circular aperture photometry on a list of FITS images.
 
     Parameters
     ----------
     df_candidates : pandas.DataFrame
-        Must contain columns 'ra', 'dec', and a nested column 'image_filenames'
+        Must contain columns 'ra', 'dec', and a nested column with FITS image paths
         (each a list of FITS image paths).
     bandname : string
         Bandname for which to do photometry.
+    image_column : string, optional
+        Name of the dataframe column containing lists of FITS image paths.
+        Default is "image_filenames_sampled".
     aperture_radius : float, optional
         Aperture radius in arcsec. Default is 1.0 for simplification.
 
@@ -519,8 +580,8 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=1.0):
 
     #for each candidate galaxy:
     for idx, row in df_candidates.iterrows():
-        filenames = row["image_filenames"][:10]  # limit to first 10 images for speed; fix later
-        print(f"Performing photometry for {len(filenames)}/{len(row['image_filenames'])} images "
+        filenames = row[image_column]
+        print(f"Performing photometry for {len(filenames)} sampled images "
               f"for the candidate at RA={row['ra']:.3f}, Dec={row['dec']:.3f} ...", end="")
 
 
@@ -910,63 +971,6 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
 ```
 
 ```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def select_images_by_mjd_quantiles(image_filenames, all_mjds, aperture_radius_pix=None, n_select=9):
-    """
-    Select up to `n_select` images using rank-quantiles of each image's observation MJD.
-
-    Parameters
-    ----------
-    image_filenames : list of str
-        List of FITS image paths.
-    all_mjds : list-like
-        MJD values aligned with ``image_filenames`` in shape.
-    aperture_radius_pix : list-like, optional
-        Per-image aperture radii in pixels, aligned with ``image_filenames``.
-    n_select : int, optional
-        Maximum number of images to select. Default is 9.
-
-    Returns
-    -------
-    tuple
-        (`selected_filenames`, `selected_mjds`, `selected_aperture_radius_pix`) ordered in increasing MJD.
-        Falls back to first n_select entries if no finite MJD values exist.
-    """
-    if aperture_radius_pix is None:
-        aperture_radius_pix = [np.nan] * len(image_filenames)
-
-    fname_mjd_r = [] # list of (fname, mjd, radius_pix) tuples for valid entries
-    for fname, mjd, radius_pix in zip(image_filenames, all_mjds, aperture_radius_pix):
-        try:
-            mjd_value = float(mjd)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(mjd_value):
-            fname_mjd_r.append((fname, mjd_value, radius_pix))
-
-    if not fname_mjd_r:
-        return (
-            image_filenames[:n_select],
-            list(all_mjds[:n_select]),
-            list(aperture_radius_pix[:n_select]),
-        )
-
-    fname_mjd_r.sort(key=lambda x: x[1]) # sort by MJD
-    num_quantiles = min(n_select, len(fname_mjd_r))
-    quantile_indices = np.rint( # round off to nearest integer
-        np.linspace(0, len(fname_mjd_r) - 1, num_quantiles)
-    ).astype(int)
-    selected = [fname_mjd_r[i] for i in quantile_indices]
-    selected_filenames = [entry[0] for entry in selected]
-    selected_mjds = [entry[1] for entry in selected]
-    selected_radius_pix = [entry[2] for entry in selected]
-    return selected_filenames, selected_mjds, selected_radius_pix
-```
-
-```{code-cell} ipython3
 # galaxy_id of my favorite candidate
 favorite = 10306000022321
 
@@ -974,12 +978,9 @@ single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
-selected_filenames, selected_mjds, selected_radius_pix = select_images_by_mjd_quantiles(
-    single_gal["image_filenames"],
-    single_gal["mjd_obs"],
-    aperture_radius_pix=single_gal["aperture_radius_pix"],
-    n_select=9
-)
+selected_filenames = single_gal["image_filenames_sampled"]
+selected_mjds = single_gal["mjd_obs"]
+selected_radius_pix = single_gal["aperture_radius_pix"]
 
 cutout_gallery(
     image_filenames=selected_filenames,
