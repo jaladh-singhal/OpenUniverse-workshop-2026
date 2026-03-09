@@ -196,7 +196,7 @@ yup, definitely different positions!
 
 ## 2. Find a TDE target from the transient catalog
 
-Instead of a GW alert, we use the OpenUniverse2024 transient input catalog — the same SNANA parquet files described in the [SED Fitting tutorial](sed_fit) — to find a TDE. The catalog stores one parquet file per HEALPix region, and TDEs are rare, so not every region will contain one. We scan the available files until we find the first TDE entry, then use its host galaxy sky position as our search center for the sections that follow.
+We use the OpenUniverse2024 transient input catalog — the same SNANA parquet files described in the [SED Fitting tutorial](sed_fit) — to find a TDE. The catalog stores one parquet file per HEALPix region, and TDEs are rare, so not every region will contain one. We scan the available files until we find the first TDE entry, then use its host galaxy sky position as our search center for the sections that follow.
 
 ```{code-cell} ipython3
 # Step 1: List available snana_*.parquet files in the catalog on S3
@@ -231,7 +231,7 @@ if tde_row is None:
 ```
 
 ```{code-cell} ipython3
-# Step 3: Load galaxy info for this region to get host RA/Dec
+# Step 3: Load galaxy info for the identified TDE region to get its host RA/Dec
 galaxy_info_file = f"{catalog_prefix}/galaxy_{tde_region}.parquet"
 gal_info = pq.read_table(galaxy_info_file, filesystem=fs).to_pandas()
 host_row = gal_info[gal_info["galaxy_id"] == tde_row["host_id"]].iloc[0]
