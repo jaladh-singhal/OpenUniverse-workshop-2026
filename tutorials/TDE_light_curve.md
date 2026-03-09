@@ -252,7 +252,7 @@ print(f"Search radius: {radius_deg}")
 ```
 
 ## 3. Data Access
-To locate data covering the region identified by the TDE target, we begin by performing a cone search in the existing OpenUniverse2024 Roman + Rubin catalogs. This step identifies all known galaxies within the sky area defined by the alert’s position and radius. The resulting catalog provides positions and IDs for each potential host galaxy.  With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
+To locate data covering the region identified by the TDE target, we begin by performing a cone search in the existing OpenUniverse2024 Roman + Rubin catalogs. This step identifies all known galaxies within some small radius of the TDE position identified above. The resulting catalog provides positions and IDs for each potential host galaxy.  With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
 
 +++
 
