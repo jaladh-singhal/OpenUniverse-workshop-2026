@@ -71,6 +71,7 @@ import astropy_healpix as ah
 import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
+import json
 
 import itertools
 ```
@@ -196,10 +197,13 @@ yup, definitely different positions!
 
 ## 2. Find a TDE target from the transient catalog
 
-We use the OpenUniverse2024 transient input catalog — the same SNANA parquet files described in the [SED Fitting tutorial](sed_fit) — to find a TDE. The catalog stores one parquet file per HEALPix region, and TDEs are rare, so not every region will contain one. We scan the available files until we find the first TDE entry, then use its host galaxy sky position as our search center for the sections that follow.
+We use the OpenUniverse2024 transient input catalog — the same SNANA parquet files described in the [SED Fitting tutorial](sed_fit) — to find a TDE.
+The catalog stores one parquet file per HEALPix region, and TDEs are rare, so not every region will contain one.
+We iterate over regions in sorted order and stop at the first TDE we find, using its host galaxy sky position as our search center for the sections that follow.
+
+First, we connect to S3 and list all available SNANA parquet files in the catalog.
 
 ```{code-cell} ipython3
-# Step 1: List available snana_*.parquet files in the catalog on S3
 fs = pyarrow.fs.S3FileSystem(anonymous=True)
 catalog_prefix = f"{BUCKET_NAME}/{OU_PREFIX}/roman/full/{CATALOG_NAME}"
 
@@ -212,8 +216,10 @@ snana_files = sorted([
 print(f"Found {len(snana_files)} snana parquet files")
 ```
 
+Next, we scan those files in order, reading each one until we find a row with `model_name == "NON1ASED.TDE-BBFIT"`.
+We record the first TDE found and the region it came from, then stop.
+
 ```{code-cell} ipython3
-# Step 2: Scan regions until we find a TDE (model_name == "NON1ASED.TDE-BBFIT")
 tde_row = None
 tde_region = None
 for path in snana_files:
@@ -230,13 +236,13 @@ if tde_row is None:
     raise RuntimeError("No TDE found in any snana parquet file.")
 ```
 
+Once we have the TDE, we load the corresponding galaxy info parquet file for that region to look up the host galaxy's sky coordinates, and set the position variables used by Section 3.
+
 ```{code-cell} ipython3
-# Step 3: Load galaxy info for the identified TDE region to get its host RA/Dec
 galaxy_info_file = f"{catalog_prefix}/galaxy_{tde_region}.parquet"
 gal_info = pq.read_table(galaxy_info_file, filesystem=fs).to_pandas()
 host_row = gal_info[gal_info["galaxy_id"] == tde_row["host_id"]].iloc[0]
 
-# Step 4: Set position variables (same interface used by Section 3)
 ra_center  = host_row["ra"] * u.deg
 dec_center = host_row["dec"] * u.deg
 radius_deg = 1 * u.arcsec
