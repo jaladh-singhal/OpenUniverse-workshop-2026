@@ -36,12 +36,12 @@ This notebook is designed to be run sequentially from top to bottom.  All code i
 
 ### Input
 
-- GW alert? or will the code go out and get one?
+- A TDE from the OpenUniverse2024 transient input catalog
 
 ### Output
 
-- Light curves of potential host galaxies
-- Cutout gallery of potential host galaxies
+- Light curve(s) of host galaxy(s)
+- Cutout gallery of host galaxy(s)
 
 ## Imports
 
@@ -221,151 +221,34 @@ Next, we scan those files in order, reading each one until we find a row with `m
 We record the first TDE found and the region it came from, then stop.
 
 ```{code-cell} ipython3
-tde_row = None
+tde_info = None
 tde_region = None
 for path in snana_files:
     df = pq.read_table(path, filesystem=fs).to_pandas()
     mask = df["model_name"] == "NON1ASED.TDE-BBFIT"
     if mask.any():
-        tde_row = df[mask].iloc[0]
+        tde_info = df[mask].iloc[0].squeeze()
         # extract region index from filename (e.g. "snana_9921.parquet" → "9921")
         tde_region = path.split("snana_")[1].replace(".parquet", "")
-        print(f"Found TDE in region {tde_region}")
+        print(f"Found a TDE in region {tde_region} with the following info:")
+        print(tde_info)
         break
 
-if tde_row is None:
+if tde_info is None:
     raise RuntimeError("No TDE found in any snana parquet file.")
 ```
 
-Once we have the TDE, we load the corresponding galaxy info parquet file for that region to look up the host galaxy's sky coordinates, and set the position variables used by Section 3.
+Once we have the TDE, we load the corresponding galaxy info parquet file for that region. Then we identify its host galaxy(s) by matching the host ID in the TDE info with the galaxy IDs in the galaxy info.
 
 ```{code-cell} ipython3
 galaxy_info_file = f"{catalog_prefix}/galaxy_{tde_region}.parquet"
 gal_info = pq.read_table(galaxy_info_file, filesystem=fs).to_pandas()
-host_row = gal_info[gal_info["galaxy_id"] == tde_row["host_id"]].iloc[0]
-
-ra_center  = host_row["ra"] * u.deg
-dec_center = host_row["dec"] * u.deg
-radius_deg = 1 * u.arcsec
-
-print(f"TDE host galaxy: RA={ra_center:.4f}, Dec={dec_center:.4f}")
-print(f"Search radius: {radius_deg}")
-```
-
-## 3. Data Access
-To locate data covering the region identified by the TDE target, we begin by performing a cone search in the existing OpenUniverse2024 Roman + Rubin catalogs. This step identifies all known galaxies within some small radius of the TDE position identified above. The resulting catalog provides positions and IDs for each potential host galaxy.  With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
-
-+++
-
-### 3.1 Catalog access
-We use the "roman_rubin_cats_v1.1.2_faint" catalog (defined above as CATALOG_NAME) because it provides precise sky positions and unique galaxy IDs for all simulated Roman + Rubin sources, allowing us to later cross-match these galaxies with other derived quantities such as photometry or physical parameters.
-We select the full survey rather than the preview version because it covers a larger sky area and represents the more recent, higher-fidelity release of the OpenUniverse2024 simulations.
-"faint" in the catalog name refers to the deeper magnitude limit of the simulation.
-
-```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def cone_search_catalog(
-    ra_center,
-    dec_center,
-    radius_deg,
-    s3_prefix=(
-        f"s3://{BUCKET_NAME}/{OU_PREFIX}/roman/full/{CATALOG_NAME}"),
-):
-    """
-    Perform a cone search on the OpenUniverse2024 Roman/Rubin galaxy_info catalogs.
-
-    Parameters
-    ----------
-    ra_center : float
-        Right Ascension of the GW localization center (degrees, ICRS).
-    dec_center : float
-        Declination of the GW localization center (degrees, ICRS).
-    radius_deg : float
-        Search radius in degrees.
-    s3_prefix : str, optional
-        Root S3 prefix for the OpenUniverse Roman/Rubin catalogs.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Subset of galaxies within the cone, including:
-        ['galaxy_id', 'ra', 'dec', 'sep_arcsec'].
-    """
-
-    # Step 1. Determine which HEALPix tiles overlap the GW cone
-    healpix = ah.HEALPix(nside=32, order="ring")
-    pixels = healpix.cone_search_lonlat(
-        lon=ra_center, lat=dec_center , radius=radius_deg )
-    print(f"Identified {len(pixels)} overlapping HEALPix regions:{pixels}")
-
-    # Step 2. Load only those parquet region files from S3
-
-    # Connect to the public S3 bucket anonymously
-    fs = s3fs.S3FileSystem(anon=True)
-
-    region_paths = []
-    flux_paths = []
-
-    for pix in pixels:
-        region_path = f"{s3_prefix}/galaxy_{pix}.parquet"
-        flux_path   = f"{s3_prefix}/galaxy_flux_{pix}.parquet"
-
-        if fs.exists(region_path):
-            region_paths.append(region_path)
-            flux_paths.append(flux_path)
-
-    # If no files were found, the localization is likely outside the simulation’s sky coverage.
-    if not region_paths:
-        print(
-            "⚠️ No matching region files found — likely the GW localization "
-            "is outside the simulated sky area."
-        )
-        return pd.DataFrame(columns=["galaxy_id", "ra", "dec", "sep_arcsec"])
-
-    df_info = ds.dataset(region_paths, format="parquet", filesystem=fs)
-    df_flux = ds.dataset(flux_paths, format="parquet", filesystem=fs)
-
-    df_info = df_info.to_table().to_pandas()
-    df_flux = df_flux.to_table().to_pandas()
-
-    #merge info and flux tables
-    df_all = pd.merge(df_info, df_flux, on="galaxy_id", how="left")
-
-    # Step 3. Fine-grained cone search on sky coordinates
-
-    # Convert both the catalog and the GW center into SkyCoord objects
-    catalog_coords = SkyCoord(df_all["ra"].values * u.deg,
-                              df_all["dec"].values * u.deg)
-    center = SkyCoord(ra_center, dec_center)
-
-    # Compute angular separation between each galaxy and the GW position
-    sep = catalog_coords.separation(center)
-    df_all["sep_arcsec"] = sep.arcsec
-
-    # Keep only galaxies within the search radius
-    mask = sep <= (radius_deg)
-    df_subset = df_all[mask]
-
-    print(f"✅ Found {len(df_subset)} galaxies within {radius_deg:.3f}° "
-          f"of RA={ra_center:.3f}, Dec={dec_center:.3f}")
-
-    return df_subset
-```
-
-```{code-cell} ipython3
-df_candidates = cone_search_catalog(ra_center,dec_center,radius_deg)
-```
-
-```{code-cell} ipython3
-# Take a look at what we have in the dataframe of candidates.
+df_candidates = gal_info[gal_info["galaxy_id"] == tde_info["host_id"]]
 df_candidates
 ```
 
-### 3.2 Image access
-Now we need to find the filenames of the images in the TDS survey which include these targets
+## 3. Image Access
+Now we have `df_candidates` as a catalog of host galaxy(s) for our TDE target, including their positions and IDs. With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
 
 ```{code-cell} ipython3
 # Make astroquery IRSA queries point to the simulated VO endpoints
@@ -395,12 +278,14 @@ def get_s3_fpath(cloud_access):
     return f's3://{bucket_name}/{key}'
 ```
 
+First, we find the filenames of the images in the Roman TDS survey which include these galaxy candidates.
+
 ```{code-cell} ipython3
 ---
 jupyter:
   source_hidden: true
 ---
-def TDS_image_search(ra_center, dec_center, radius_deg, bandname):
+def TDS_image_search(ra_center, dec_center, radius, bandname):
     """
     Query OpenUniverse2024 Roman TDS images within a given sky radius.
 
@@ -410,8 +295,8 @@ def TDS_image_search(ra_center, dec_center, radius_deg, bandname):
         Right Ascension of the GW localization center (degrees, ICRS).
     dec_center : float
         Declination of the GW localization center (degrees, ICRS).
-    radius_deg : float
-        Search radius in degrees.
+    radius : astropy.units.Quantity
+        Search radius.
     bandname : string
         bandname for which to do photometry
 
@@ -421,9 +306,8 @@ def TDS_image_search(ra_center, dec_center, radius_deg, bandname):
         Should start with the str "s3://"
     """
     coords = SkyCoord(ra_center, dec_center, unit='deg')
-    size = radius_deg * u.deg
 
-    sia_results = Irsa.query_sia(pos=(coords, size), collection=OU_ROMAN_SIA_COLLECTION)
+    sia_results = Irsa.query_sia(pos=(coords, radius), collection=OU_ROMAN_SIA_COLLECTION)
     filtered_results = sia_results[['TDS_simple_model' in row['obs_id'] and bandname in row['energy_bandpassname']
                                     for row in sia_results]]
     
@@ -436,7 +320,7 @@ def TDS_image_search(ra_center, dec_center, radius_deg, bandname):
 jupyter:
   source_hidden: true
 ---
-def get_TDS_images(df_candidates, radius_deg, bandname):
+def get_TDS_images(df_candidates, radius, bandname):
     """
     Get images from the Roman TDS dataset for each galaxy candidate.
 
@@ -444,8 +328,8 @@ def get_TDS_images(df_candidates, radius_deg, bandname):
     ----------
     df_candidates : pandas.DataFrame
         Must include 'galaxy_id', 'ra', and 'dec' columns.
-    radius_deg : float
-        Search radius in degrees passed to TDS_image_search().
+    radius : astropy.units.Quantity
+        Search radius passed to TDS_image_search().
     bandname : string
         name of the filter to use
 
@@ -459,7 +343,7 @@ def get_TDS_images(df_candidates, radius_deg, bandname):
         galaxy_id = row["galaxy_id"]
         ra, dec = row["ra"], row["dec"]
         print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra:.3f}, Dec={dec:.3f} ...", end="")
-        filenames = TDS_image_search(ra, dec, radius_deg, bandname)
+        filenames = TDS_image_search(ra, dec, radius.to(u.deg), bandname)
         print(f"done. Found {len(filenames)} images.")
         image_map[galaxy_id] = filenames
 
@@ -468,9 +352,11 @@ def get_TDS_images(df_candidates, radius_deg, bandname):
 
 ```{code-cell} ipython3
 bandname = "J129"
-image_search_radius = 10 * u.arcsec # TODO: do even narrower? we just want images containing the candidate which should
-candidates_images = get_TDS_images(df_candidates, image_search_radius.deg, bandname)
+image_search_radius = 1 * u.arcsec # since we just need images containing the candidate
+candidates_images = get_TDS_images(df_candidates, image_search_radius, bandname)
 ```
+
+TODO: following sections will be updates based on number of images found.
 
 Since there are ~700 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images to add in the candidates dataframe.
 
