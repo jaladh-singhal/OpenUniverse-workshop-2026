@@ -71,6 +71,7 @@ import astropy_healpix as ah
 import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
+import hpgeom
 import json
 from astroquery.ipac.irsa import Irsa
 
@@ -217,31 +218,40 @@ snana_files = sorted([
 print(f"Found {len(snana_files)} snana parquet files")
 ```
 
-Next, we scan those files in order, reading each one until we find a row with `model_name == "NON1ASED.TDE-BBFIT"`.
-We record the first TDE found and the region it came from, then stop.
+Since our goal is to make a light curve for a TDE, we need to pick a SNANA parquet file that is covered by the Roman Time-Domain Survey (TDS).
 
 ```{code-cell} ipython3
-tde_info = None
-tde_region = None
-for path in snana_files:
-    df = pq.read_table(path, filesystem=fs).to_pandas()
-    mask = df["model_name"] == "NON1ASED.TDE-BBFIT"
-    if mask.any():
-        tde_info = df[mask].iloc[0].squeeze()
-        # extract region index from filename (e.g. "snana_9921.parquet" → "9921")
-        tde_region = path.split("snana_")[1].replace(".parquet", "")
-        print(f"Found a TDE in region {tde_region} with the following info:")
-        print(tde_info)
-        break
+# Time Domain Survey (TDS) is centered at LSST ELAIS-S1 DDF:
+ra = 9.45
+dec = -44.02
 
-if tde_info is None:
-    raise RuntimeError("No TDE found in any snana parquet file.")
+# In snana_{region}.parquet, region is HEALPix pixel ID at order 5 (nside=32) with RING ordering
+nside = 32
+nest = False
+
+# Convert TDS center coordinates to region ID used in the naming of SNANA parquet files
+region = hpgeom.angle_to_pixel(nside, ra, dec, lonlat=True, nest=False)
+snana_path = [f for f in snana_files if f"snana_{region}.parquet" in f][0]
+snana_path
+```
+
+Next, we scan this file and find a row with `model_name == "NON1ASED.TDE-BBFIT"` that represents a TDE.
+
+```{code-cell} ipython3
+df = pq.read_table(snana_path, filesystem=fs).to_pandas()
+mask = df["model_name"] == "NON1ASED.TDE-BBFIT"
+if mask.any():
+    tde_info = df[mask].iloc[0].squeeze()
+    print(f"Found a TDE in region {region} with the following info:")
+    print(tde_info)
+else:
+    raise RuntimeError(f"No TDE found in region {region}.")
 ```
 
 Once we have the TDE, we load the corresponding galaxy info parquet file for that region. Then we identify its host galaxy(s) by matching the host ID in the TDE info with the galaxy IDs in the galaxy info.
 
 ```{code-cell} ipython3
-galaxy_info_file = f"{catalog_prefix}/galaxy_{tde_region}.parquet"
+galaxy_info_file = f"{catalog_prefix}/galaxy_{region}.parquet"
 gal_info = pq.read_table(galaxy_info_file, filesystem=fs).to_pandas()
 df_candidates = gal_info[gal_info["galaxy_id"] == tde_info["host_id"]]
 df_candidates
@@ -261,8 +271,8 @@ Irsa.list_collections(servicetype='SIA')
 ```
 
 ```{code-cell} ipython3
-OU_ROMAN_SIA_COLLECTION = 'simulated_roman_troxel2024'
-OU_RUBIN_SIA_COLLECTION = 'simulated_rubin_troxel2024'
+OU_ROMAN_SIA_COLLECTION = 'simulated_roman_openuniverse2024'
+OU_RUBIN_SIA_COLLECTION = 'simulated_rubin_openuniverse2024'
 ```
 
 ```{code-cell} ipython3
@@ -352,11 +362,11 @@ def get_TDS_images(df_candidates, radius, bandname):
 
 ```{code-cell} ipython3
 bandname = "J129"
-image_search_radius = 1 * u.arcsec # since we just need images containing the candidate
+image_search_radius = 1 * u.arcsec # narrow since we just need images containing the candidate
 candidates_images = get_TDS_images(df_candidates, image_search_radius, bandname)
 ```
 
-TODO: following sections will be updates based on number of images found.
+TODO: following sections will be updates based on number of images found. Read t_min from SIA table and do mjd based sampling of 9 images that atleast have candidate 100 px away from the edge of the image (for cutouts).
 
 Since there are ~700 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images to add in the candidates dataframe.
 
