@@ -252,8 +252,10 @@ Once we have the TDE, we load the corresponding galaxy info parquet file for tha
 
 ```{code-cell} ipython3
 galaxy_info_file = f"{catalog_prefix}/galaxy_{region}.parquet"
-gal_info = pq.read_table(galaxy_info_file, filesystem=fs).to_pandas()
-df_candidates = gal_info[gal_info["galaxy_id"] == tde_info["host_id"]]
+df_candidates = pq.read_table(galaxy_info_file, filesystem=fs,
+                              # filter while reading pq for time efficiency
+                              filters=[("galaxy_id", "==", tde_info["host_id"])]
+                              ).to_pandas()
 df_candidates
 ```
 
@@ -288,7 +290,7 @@ def get_s3_fpath(cloud_access):
     return f's3://{bucket_name}/{key}'
 ```
 
-First, we find the filenames of the images in the Roman TDS survey which include these galaxy candidates.
+First, we find the filenames of the images in the Roman TDS survey which include these galaxy candidates. Since there are > 100 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images based on MJD quantiles.
 
 ```{code-cell} ipython3
 ---
@@ -312,8 +314,8 @@ def TDS_image_search(ra_center, dec_center, radius, bandname):
 
     Returns
     -------
-    image_filenames : list (str)
-        Should start with the str "s3://"
+    astropy Table
+        Table of SIA results with an added 's3_uri' column for the image file paths.
     """
     coords = SkyCoord(ra_center, dec_center, unit='deg')
 
@@ -321,8 +323,38 @@ def TDS_image_search(ra_center, dec_center, radius, bandname):
     filtered_results = sia_results[['TDS_simple_model' in row['obs_id'] and bandname in row['energy_bandpassname']
                                     for row in sia_results]]
     
-    image_filenames = [get_s3_fpath(row['cloud_access']) for row in filtered_results]
-    return image_filenames
+    filtered_results['s3_uri'] = [get_s3_fpath(row['cloud_access']) for row in filtered_results]
+    return filtered_results
+```
+
+```{code-cell} ipython3
+---
+jupyter:
+  source_hidden: true
+---
+def select_images_by_mjd_quantiles(images, n_select=9):
+    """
+    Select up to `n_select` images using rank-quantiles on time axis.
+
+    Parameters
+    ----------
+    images : astropy Table
+        Table of images (SIA results).
+    n_select : int, optional
+        Maximum number of images to select. Default is 9.
+
+    Returns
+    -------
+    astropy Table
+        Subset of input `images` corresponding to the selected quantiles.
+    """
+    sorted_images = images.copy()  # avoid modifying the original table
+    sorted_images.sort('t_min') # sort by time axis, t_min = t_max for TDS images, so we can use either
+    num_quantiles = min(n_select, len(sorted_images))
+    quantile_indices = np.rint(  # round off to nearest integer
+        np.linspace(0, len(sorted_images) - 1, num_quantiles)
+    ).astype(int)
+    return sorted_images[quantile_indices]
 ```
 
 ```{code-cell} ipython3
@@ -350,84 +382,31 @@ def get_TDS_images(df_candidates, radius, bandname):
     """
     image_map = {}
     for _, row in df_candidates.iterrows():
-        galaxy_id = row["galaxy_id"]
+        galaxy_id = int(row["galaxy_id"])
         ra, dec = row["ra"], row["dec"]
         print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra:.3f}, Dec={dec:.3f} ...", end="")
-        filenames = TDS_image_search(ra, dec, radius.to(u.deg), bandname)
-        print(f"done. Found {len(filenames)} images.")
-        image_map[galaxy_id] = filenames
+        image_results = TDS_image_search(ra, dec, radius.to(u.deg), bandname)
+        print(f"done. Found {len(image_results)} images.")
+        image_map[galaxy_id] = image_results
 
     return image_map
 ```
 
 ```{code-cell} ipython3
 bandname = "J129"
-image_search_radius = 1 * u.arcsec # narrow since we just need images containing the candidate
+image_search_radius = 1 * u.arcsec # point-like since we just need images containing the candidate
 candidates_images = get_TDS_images(df_candidates, image_search_radius, bandname)
-```
-
-TODO: following sections will be updates based on number of images found. Read t_min from SIA table and do mjd based sampling of 9 images that atleast have candidate 100 px away from the edge of the image (for cutouts).
-
-Since there are ~700 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images to add in the candidates dataframe.
-
-```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def select_images_by_mjd_quantiles(image_filenames, n_select=10):
-    """
-    Select up to `n_select` filenames using rank-quantiles of observation MJD.
-
-    Parameters
-    ----------
-    image_filenames : list of str
-        List of FITS image paths.
-    n_select : int, optional
-        Maximum number of images to select. Default is 10.
-
-    Returns
-    -------
-    list of str
-        Selected filenames ordered in increasing MJD.
-        Falls back to the first n_select filenames if no finite MJD values exist.
-    """
-    fname_mjd = []  # list of (fname, mjd) tuples for valid entries
-    for fname in image_filenames:
-        try:
-            # DO NOT read time from header but from SIA results for quick sampling
-            hdr = fits.getheader(fname, ext=1, fsspec_kwargs={"anon": True})
-            # TODO: read MJD from SIA results instead of header for speed
-            mjd = hdr.get("MJD-OBS", np.nan)
-            mjd_value = float(mjd)
-        except Exception:
-            continue
-        if np.isfinite(mjd_value):
-            fname_mjd.append((fname, mjd_value))
-
-    if not fname_mjd:
-        return image_filenames[:n_select]
-
-    fname_mjd.sort(key=lambda x: x[1])  # sort by MJD
-    num_quantiles = min(n_select, len(fname_mjd))
-    quantile_indices = np.rint(  # round off to nearest integer
-        np.linspace(0, len(fname_mjd) - 1, num_quantiles)
-    ).astype(int)
-    print(f"Selected {len(quantile_indices)} out of {len(fname_mjd)} images.")
-    return [fname_mjd[i][0] for i in quantile_indices]
 ```
 
 ```{code-cell} ipython3
 image_filenames = []
 
 for _, row in df_candidates.iterrows():
-    print(f"Reading MJD of each TDS image for galaxy_id={row['galaxy_id']} to pick a representative sample...")
-    selected_images = select_images_by_mjd_quantiles(candidates_images.get(row["galaxy_id"], []), n_select=10)
-    print(f"Selected {len(selected_images)}/{len(candidates_images[row['galaxy_id']])} images.\n")
-
-    # Replace above with the following for the full list of images for each candidate
-    # selected_images = candidates_images.get(row["galaxy_id"], [])
-    image_filenames.append(selected_images)
+    galaxy_id = int(row["galaxy_id"])
+    selected_images = select_images_by_mjd_quantiles(candidates_images[galaxy_id])
+    print(f"Galaxy {galaxy_id}: Downsampled {len(candidates_images[galaxy_id])} images to {len(selected_images)} images selected by MJD quantiles.")
+    
+    image_filenames.append(selected_images['s3_uri'].tolist())
 
 df_candidates["image_filenames"] = image_filenames
 ```
@@ -445,7 +424,7 @@ This section demonstrates how to extract and visualize a light curve for a poten
 jupyter:
   source_hidden: true
 ---
-def run_aperture_photometry(df_candidates, bandname, image_column="image_filenames_sampled", aperture_radius=1.0):
+def run_aperture_photometry(df_candidates, bandname, image_column="image_filenames", aperture_radius=1.0):
     """
     Perform circular aperture photometry on a list of FITS images.
 
@@ -458,7 +437,7 @@ def run_aperture_photometry(df_candidates, bandname, image_column="image_filenam
         Bandname for which to do photometry.
     image_column : string, optional
         Name of the dataframe column containing lists of FITS image paths.
-        Default is "image_filenames_sampled".
+        Default is "image_filenames".
     aperture_radius : float, optional
         Aperture radius in arcsec. Default is 1.0 for simplification.
 
@@ -690,19 +669,13 @@ def plot_candidate_light_curves(df, bandname):
 
 ```{code-cell} ipython3
 #grab one of the galaxy_ids from the printed out dataframe above
-favorite = 10306000022321
+favorite = int(df.iloc[0]['galaxy_id'])
 fig_single = plot_single_light_curve(df, favorite, bandname)
 ```
-
-This will look better when they are a real time series and not all taken at the same time, also the warning about xlim being set to the same min and max will go away.
 
 ```{code-cell} ipython3
 fig_all_candidates = plot_candidate_light_curves(df, bandname)
 ```
-
-all galaxy ids are faked to have the same set of images for photometry hence the points exactly line on top of each other.
-
-+++
 
 ## 5. Make Cutouts
 We follow the example in this [tutorial](https://caltech-ipac.github.io/irsa-tutorials/openuniverse2024-roman-simulated-timedomainsurvey/) to display cutouts of the potential host galaxies as a function of time with the time listed in the cutout title.
@@ -768,10 +741,14 @@ def make_cutout(fname, ra, dec, size=100):
 
         rot_wcs = WCS(header)
 
-        # Build cutout
-        cutout = Cutout2D(rot_img, coord, size, wcs=rot_wcs, mode="partial")
-
-        return cutout
+        try:
+            # Build cutout
+            cutout = Cutout2D(rot_img, coord, size, wcs=rot_wcs, mode="partial")
+            return cutout
+        except Exception as e:
+            print(f"Error creating cutout for {fname}: {e}")
+            return None
+        
 ```
 
 ```{code-cell} ipython3
@@ -867,14 +844,13 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
 ```
 
 ```{code-cell} ipython3
-# galaxy_id of my favorite candidate
-favorite = 10306000022321
+# make cutout gallery of my favorite candidate
 
 single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
-selected_filenames = single_gal["image_filenames_sampled"]
+selected_filenames = single_gal["image_filenames"]
 selected_mjds = single_gal["mjd_obs"]
 selected_radius_pix = single_gal["aperture_radius_pix"]
 
