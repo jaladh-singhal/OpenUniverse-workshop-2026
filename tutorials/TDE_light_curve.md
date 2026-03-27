@@ -11,7 +11,7 @@ kernelspec:
   language: python
 ---
 
-# GW Host
+# TDE Light Curve
 
 ## Learning Goals
 
@@ -28,7 +28,9 @@ The [OpenUniverse2024]((https://arxiv.org/abs/2501.05632)) simulation suite deli
 
 Tidal Disruption Events (TDEs) occur when a star passes close enough to a supermassive black hole to be torn apart by tidal forces, producing a luminous flare that can outshine the host galaxy for weeks to months.
 Identifying and characterizing TDE host galaxies is key to understanding the demographics of supermassive black holes and the galactic environments that produce these rare events.
-This notebook demonstrates how to locate a simulated TDE from the OpenUniverse2024 transient input catalog, identify its host galaxy, and extract optical and infrared photometry from Roman and Rubin images to construct a multi-epoch light curve.
+This notebook demonstrates how to locate a simulated TDE from the OpenUniverse2024 transient input catalog, identify its host galaxy, and extract optical and infrared photometry from Roman images to construct a multi-epoch light curve. 
+The OpenUniverse2024 dataset also provides matched Rubin optical coverage over the same sky.
+With a few simple changes in Sections 3 and 4, this workflow can be extended to other Roman and Rubin bands to build a true multi-wavelength light curve.  
 
 ### Instructions
 
@@ -52,7 +54,7 @@ starttime = time.time()
 
 ```{code-cell} ipython3
 # Uncomment the next line to install dependencies if needed.
-# !pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow astropy-healpix
+# !pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow hpgeom astroquery
 ```
 
 ```{code-cell} ipython3
@@ -67,7 +69,6 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.nddata import Cutout2D
 from astropy.wcs import WCS
-import astropy_healpix as ah
 import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
@@ -193,7 +194,6 @@ def show_gallery(files, max_images=9):
 show_gallery(files)
 ```
 
-yup, definitely different positions!
 
 +++
 
@@ -201,7 +201,16 @@ yup, definitely different positions!
 
 We use the OpenUniverse2024 transient input catalog — the same SNANA parquet files described in the [SED Fitting tutorial](sed_fit) — to find a TDE.
 The catalog stores one parquet file per HEALPix region, and TDEs are rare, so not every region will contain one.
-We iterate over regions in sorted order and stop at the first TDE we find, using its host galaxy sky position as our search center for the sections that follow.
+The catalog is split into three types of parquet files, each indexed by HEALPix region:                                                                                                
+                                                                                                                                                               
+   1. snana_{region}.parquet — the transient source catalog, with one row per simulated event (supernovae, TDEs, etc.), including fields such as the event    
+  type (model_name) and the ID of the host galaxy (host_id)                                                                                                    
+   2. galaxy_{region}.parquet — the host galaxy catalog, with sky positions and physical properties for each galaxy                                           
+   3. galaxy_flux_{region}.parquet — multi-band photometry for each galaxy (used in the SED Fitting tutorial but not needed here)                             
+   
+TDEs are rare, so not every region will contain one.
+We use the known center of the Roman Time-Domain Survey to target the right region directly. 
+We then cross-match the TDE's host_id into the galaxy file to retrieve the host's sky coordinates for the image search that follows.
 
 First, we connect to S3 and list all available SNANA parquet files in the catalog.
 
@@ -209,6 +218,7 @@ First, we connect to S3 and list all available SNANA parquet files in the catalo
 fs = pyarrow.fs.S3FileSystem(anonymous=True)
 catalog_prefix = f"{BUCKET_NAME}/{OU_PREFIX}/roman/full/{CATALOG_NAME}"
 
+# List all SNANA parquet files in the catalog directory, sorted for consistent ordering.
 file_info = fs.get_file_info(pyarrow.fs.FileSelector(catalog_prefix, recursive=False))
 snana_files = sorted([
     f.path for f in file_info
@@ -238,9 +248,12 @@ snana_path
 Next, we scan this file and find a row with `model_name == "NON1ASED.TDE-BBFIT"` that represents a TDE.
 
 ```{code-cell} ipython3
+# Read the parquet file into a pandas dataframe.
 df = pq.read_table(snana_path, filesystem=fs).to_pandas()
+# Look for TDE models. 
 mask = df["model_name"] == "NON1ASED.TDE-BBFIT"
 if mask.any():
+   # Choose the first TDE
     tde_info = df[mask].iloc[0].squeeze()
     print(f"Found a TDE in region {region} with the following info:")
     print(tde_info)
@@ -417,7 +430,9 @@ df_candidates
 ```
 
 ## 4.  Make a Light Curve
-This section demonstrates how to extract and visualize a light curve for a potential gravitational-wave host galaxy using simulated Roman images. The first function, `run_aperture_photometry()`, performs simple circular aperture photometry on a set of FITS images from S3 using the astropy [photutils](https://photutils.readthedocs.io/en/stable/) package . The second function, `plot_light_curve()`, then compiles these measurements into a time-ordered plot showing how the observed flux evolves across multiple visits, providing a first look at temporal variability that could signal transient activity or host-galaxy changes.
+This section demonstrates how to extract and visualize a light curve for a Tidal Disruption Event using simulated Roman images. 
+The first function, `run_aperture_photometry()`, performs simple circular aperture photometry on a set of FITS images from S3 using the astropy [photutils](https://photutils.readthedocs.io/en/stable/) package. 
+The second function, `plot_light_curve()`, then compiles these measurements into a time-ordered plot showing how the observed flux evolves across multiple visits, providing a first look at temporal variability that could signal transient activity or host-galaxy changes.
 
 ```{code-cell} ipython3
 ---
@@ -439,7 +454,7 @@ def run_aperture_photometry(df_candidates, bandname, image_column="image_filenam
         Name of the dataframe column containing lists of FITS image paths.
         Default is "image_filenames".
     aperture_radius : float, optional
-        Aperture radius in arcsec. Default is 1.0 for simplification.
+        Aperture radius in arcsec. Default is 1.0 arcseconds which is ~9 pixels for Roman .
 
     Returns
     -------
@@ -522,7 +537,8 @@ def run_aperture_photometry(df_candidates, bandname, image_column="image_filenam
 ```
 
 ```{code-cell} ipython3
-df = run_aperture_photometry(df_candidates, bandname)
+# We choose an aperture radius of 1.0 arcsec(~9 Roman pixels at 0.11"/pix)
+df = run_aperture_photometry(df_candidates, bandname, aperture_radius= 1.0)
 ```
 
 ```{code-cell} ipython3
@@ -757,7 +773,7 @@ jupyter:
   source_hidden: true
 ---
 def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list, size=100, ncols=4,
-                   galaxy_id=None, superevent_id=None):
+                   galaxy_id=None):
     """
     Display a gallery of cutouts centered on (RA, Dec) for a list of Roman TDS images.
 
@@ -778,7 +794,6 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
     galaxy_id : int or str, optional
         Galaxy ID for labeling the plot.
     superevent_id : str, optional
-        GW superevent ID for labeling the plot.
 
     Returns
     -------
@@ -887,13 +902,13 @@ Andreas Faisst, Vandana Desai
 **Contact:** [IRSA Helpdesk](https://irsa.ipac.caltech.edu/docs/help_desk.html) with questions
 or problems.
 
-**Runtime:** As of the date above, this notebook takes about 10 years to run to completion on
+**Runtime:** As of the date above, this notebook takes about 200s to run to completion on
 a machine with 8GB RAM and 4 CPU.
 
 
 **AI Acknowledgement:**
 
-This tutorial was developed with the assistance of OpenAI’s ChatGPT (GPT-5)
+This tutorial was developed with the assistance of AI tools
 
 **References:**
 
