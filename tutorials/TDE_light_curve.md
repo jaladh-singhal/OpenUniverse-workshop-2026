@@ -303,42 +303,57 @@ def get_s3_fpath(cloud_access):
     return f's3://{bucket_name}/{key}'
 ```
 
-First, we find the filenames of the images in the Roman TDS survey which include these galaxy candidates. Since there are > 100 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images based on MJD quantiles.
+First, we find the filenames of the images in the Roman TDS survey which include these galaxy candidates.
 
 ```{code-cell} ipython3
 ---
 jupyter:
   source_hidden: true
 ---
-def TDS_image_search(ra_center, dec_center, radius, bandname):
+def TDS_image_search(df_candidates, radius, bandname):
     """
-    Query OpenUniverse2024 Roman TDS images within a given sky radius.
+    Get OpenUniverse2024 Roman TDS images for each galaxy candidate.
 
     Parameters
     ----------
-    ra_center : float
-        Right Ascension of the GW localization center (degrees, ICRS).
-    dec_center : float
-        Declination of the GW localization center (degrees, ICRS).
+    df_candidates : pandas.DataFrame
+        Must include 'galaxy_id', 'ra', and 'dec' columns.
     radius : astropy.units.Quantity
         Search radius.
     bandname : string
-        bandname for which to do photometry
+        Bandname for which to do photometry.
 
     Returns
     -------
-    astropy Table
-        Table of SIA results with an added 's3_uri' column for the image file paths.
+    dict
+        Dictionary where keys are galaxy IDs and values are SIA result tables
+        with an added 's3_uri' column for the image file paths.
     """
-    coords = SkyCoord(ra_center, dec_center, unit='deg')
+    image_map = {}
+    for _, row in df_candidates.iterrows():
+        galaxy_id = int(row["galaxy_id"])
+        ra_center, dec_center = row["ra"], row["dec"]
+        print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra_center:.3f}, Dec={dec_center:.3f} ...", end="")
 
-    sia_results = Irsa.query_sia(pos=(coords, radius), collection=OU_ROMAN_SIA_COLLECTION)
-    filtered_results = sia_results[['TDS_simple_model' in row['obs_id'] and bandname in row['energy_bandpassname']
-                                    for row in sia_results]]
-    
-    filtered_results['s3_uri'] = [get_s3_fpath(row['cloud_access']) for row in filtered_results]
-    return filtered_results
+        coords = SkyCoord(ra_center, dec_center, unit='deg')
+        sia_results = Irsa.query_sia(pos=(coords, radius.to(u.deg)), collection=OU_ROMAN_SIA_COLLECTION)
+        filtered_results = sia_results[['TDS_simple_model' in row['obs_id'] and bandname in row['energy_bandpassname']
+                                        for row in sia_results]]
+        filtered_results['s3_uri'] = [get_s3_fpath(row['cloud_access']) for row in filtered_results]
+
+        print(f"done. Found {len(filtered_results)} images.")
+        image_map[galaxy_id] = filtered_results
+
+    return image_map
 ```
+
+```{code-cell} ipython3
+bandname = "J129"
+image_search_radius = 1 * u.arcsec # point-like since we just need images containing the candidate
+candidates_images = TDS_image_search(df_candidates, image_search_radius, bandname)
+```
+
+Since there are > 100 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images based on MJD quantiles.
 
 ```{code-cell} ipython3
 ---
@@ -368,47 +383,6 @@ def select_images_by_mjd_quantiles(images, n_select=9):
         np.linspace(0, len(sorted_images) - 1, num_quantiles)
     ).astype(int)
     return sorted_images[quantile_indices]
-```
-
-```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def get_TDS_images(df_candidates, radius, bandname):
-    """
-    Get images from the Roman TDS dataset for each galaxy candidate.
-
-    Parameters
-    ----------
-    df_candidates : pandas.DataFrame
-        Must include 'galaxy_id', 'ra', and 'dec' columns.
-    radius : astropy.units.Quantity
-        Search radius passed to TDS_image_search().
-    bandname : string
-        name of the filter to use
-
-    Returns
-    -------
-    dict
-        Dictionary where keys are galaxy IDs and values are image filename lists.
-    """
-    image_map = {}
-    for _, row in df_candidates.iterrows():
-        galaxy_id = int(row["galaxy_id"])
-        ra, dec = row["ra"], row["dec"]
-        print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra:.3f}, Dec={dec:.3f} ...", end="")
-        image_results = TDS_image_search(ra, dec, radius.to(u.deg), bandname)
-        print(f"done. Found {len(image_results)} images.")
-        image_map[galaxy_id] = image_results
-
-    return image_map
-```
-
-```{code-cell} ipython3
-bandname = "J129"
-image_search_radius = 1 * u.arcsec # point-like since we just need images containing the candidate
-candidates_images = get_TDS_images(df_candidates, image_search_radius, bandname)
 ```
 
 ```{code-cell} ipython3
@@ -793,7 +767,6 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
         Number of columns in the gallery grid. Default = 4.
     galaxy_id : int or str, optional
         Galaxy ID for labeling the plot.
-    superevent_id : str, optional
 
     Returns
     -------
@@ -822,9 +795,9 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
     axes = np.atleast_1d(axes).ravel()
 
     # Build figure title if information is available
-    if galaxy_id is not None and superevent_id is not None:
+    if galaxy_id is not None:
         fig.suptitle(
-            f"Cutouts of host galaxy candidate {galaxy_id} for GW event {superevent_id}",
+            f"Cutouts of host galaxy candidate {galaxy_id} for TDE event",
             fontsize=14, y=0.98
         )
     elif galaxy_id is not None:
