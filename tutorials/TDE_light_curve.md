@@ -11,7 +11,7 @@ kernelspec:
   language: python
 ---
 
-# GW Host
+# TDE Light Curve
 
 ## Learning Goals
 
@@ -28,7 +28,9 @@ The [OpenUniverse2024]((https://arxiv.org/abs/2501.05632)) simulation suite deli
 
 Tidal Disruption Events (TDEs) occur when a star passes close enough to a supermassive black hole to be torn apart by tidal forces, producing a luminous flare that can outshine the host galaxy for weeks to months.
 Identifying and characterizing TDE host galaxies is key to understanding the demographics of supermassive black holes and the galactic environments that produce these rare events.
-This notebook demonstrates how to locate a simulated TDE from the OpenUniverse2024 transient input catalog, identify its host galaxy, and extract optical and infrared photometry from Roman and Rubin images to construct a multi-epoch light curve.
+This notebook demonstrates how to locate a simulated TDE from the OpenUniverse2024 transient input catalog, identify its host galaxy, and extract optical and infrared photometry from Roman images to construct a multi-epoch light curve. 
+The OpenUniverse2024 dataset also provides matched Rubin optical coverage over the same sky.
+With a few simple changes in Sections 3 and 4, this workflow can be extended to other Roman and Rubin bands to build a true multi-wavelength light curve.  
 
 ### Instructions
 
@@ -36,12 +38,12 @@ This notebook is designed to be run sequentially from top to bottom.  All code i
 
 ### Input
 
-- GW alert? or will the code go out and get one?
+- A TDE from the OpenUniverse2024 transient input catalog
 
 ### Output
 
-- Light curves of potential host galaxies
-- Cutout gallery of potential host galaxies
+- Light curve(s) of host galaxy(s)
+- Cutout gallery of host galaxy(s)
 
 ## Imports
 
@@ -52,7 +54,7 @@ starttime = time.time()
 
 ```{code-cell} ipython3
 # Uncomment the next line to install dependencies if needed.
-# !pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow astropy-healpix
+# !pip install numpy astropy s3fs photutils matplotlib scipy pandas fsspec pyarrow hpgeom astroquery
 ```
 
 ```{code-cell} ipython3
@@ -61,17 +63,18 @@ import numpy as np
 import s3fs
 from matplotlib import pyplot as plt
 import pandas as pd
-from photutils.aperture import CircularAperture, aperture_photometry
+from photutils.aperture import SkyCircularAperture, aperture_photometry
 from scipy.ndimage import rotate
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.nddata import Cutout2D
 from astropy.wcs import WCS
-import astropy_healpix as ah
 import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
+import hpgeom
 import json
+from astroquery.ipac.irsa import Irsa
 
 import itertools
 ```
@@ -191,7 +194,6 @@ def show_gallery(files, max_images=9):
 show_gallery(files)
 ```
 
-yup, definitely different positions!
 
 +++
 
@@ -199,7 +201,16 @@ yup, definitely different positions!
 
 We use the OpenUniverse2024 transient input catalog — the same SNANA parquet files described in the [SED Fitting tutorial](sed_fit) — to find a TDE.
 The catalog stores one parquet file per HEALPix region, and TDEs are rare, so not every region will contain one.
-We iterate over regions in sorted order and stop at the first TDE we find, using its host galaxy sky position as our search center for the sections that follow.
+The catalog is split into three types of parquet files, each indexed by HEALPix region:                                                                                                
+                                                                                                                                                               
+   1. snana_{region}.parquet — the transient source catalog, with one row per simulated event (supernovae, TDEs, etc.), including fields such as the event    
+  type (model_name) and the ID of the host galaxy (host_id)                                                                                                    
+   2. galaxy_{region}.parquet — the host galaxy catalog, with sky positions and physical properties for each galaxy                                           
+   3. galaxy_flux_{region}.parquet — multi-band photometry for each galaxy (used in the SED Fitting tutorial but not needed here)                             
+   
+TDEs are rare, so not every region will contain one.
+We use the known center of the Roman Time-Domain Survey to target the right region directly. 
+We then cross-match the TDE's host_id into the galaxy file to retrieve the host's sky coordinates for the image search that follows.
 
 First, we connect to S3 and list all available SNANA parquet files in the catalog.
 
@@ -207,6 +218,7 @@ First, we connect to S3 and list all available SNANA parquet files in the catalo
 fs = pyarrow.fs.S3FileSystem(anonymous=True)
 catalog_prefix = f"{BUCKET_NAME}/{OU_PREFIX}/roman/full/{CATALOG_NAME}"
 
+# List all SNANA parquet files in the catalog directory, sorted for consistent ordering.
 file_info = fs.get_file_info(pyarrow.fs.FileSelector(catalog_prefix, recursive=False))
 snana_files = sorted([
     f.path for f in file_info
@@ -216,197 +228,66 @@ snana_files = sorted([
 print(f"Found {len(snana_files)} snana parquet files")
 ```
 
-Next, we scan those files in order, reading each one until we find a row with `model_name == "NON1ASED.TDE-BBFIT"`.
-We record the first TDE found and the region it came from, then stop.
+Since our goal is to make a light curve for a TDE, we need to pick a SNANA parquet file that is covered by the Roman Time-Domain Survey (TDS).
 
 ```{code-cell} ipython3
-tde_row = None
-tde_region = None
-for path in snana_files:
-    df = pq.read_table(path, filesystem=fs).to_pandas()
-    mask = df["model_name"] == "NON1ASED.TDE-BBFIT"
-    if mask.any():
-        tde_row = df[mask].iloc[0]
-        # extract region index from filename (e.g. "snana_9921.parquet" → "9921")
-        tde_region = path.split("snana_")[1].replace(".parquet", "")
-        print(f"Found TDE in region {tde_region}")
-        break
+# Time Domain Survey (TDS) is centered at LSST ELAIS-S1 DDF:
+ra = 9.45
+dec = -44.02
 
-if tde_row is None:
-    raise RuntimeError("No TDE found in any snana parquet file.")
+# In snana_{region}.parquet, region is HEALPix pixel ID at order 5 (nside=32) with RING ordering
+nside = 32
+nest = False
+
+# Convert TDS center coordinates to region ID used in the naming of SNANA parquet files
+region = hpgeom.angle_to_pixel(nside, ra, dec, lonlat=True, nest=False)
+snana_path = [f for f in snana_files if f"snana_{region}.parquet" in f][0]
+snana_path
 ```
 
-Once we have the TDE, we load the corresponding galaxy info parquet file for that region to look up the host galaxy's sky coordinates, and set the position variables used by Section 3.
+Next, we scan this file and find a row with `model_name == "NON1ASED.TDE-BBFIT"` that represents a TDE.
 
 ```{code-cell} ipython3
-galaxy_info_file = f"{catalog_prefix}/galaxy_{tde_region}.parquet"
-gal_info = pq.read_table(galaxy_info_file, filesystem=fs).to_pandas()
-host_row = gal_info[gal_info["galaxy_id"] == tde_row["host_id"]].iloc[0]
-
-ra_center  = host_row["ra"] * u.deg
-dec_center = host_row["dec"] * u.deg
-radius_deg = 1 * u.arcsec
-
-print(f"TDE host galaxy: RA={ra_center:.4f}, Dec={dec_center:.4f}")
-print(f"Search radius: {radius_deg}")
+# Read the parquet file into a pandas dataframe.
+df = pq.read_table(snana_path, filesystem=fs).to_pandas()
+# Look for TDE models. 
+mask = df["model_name"] == "NON1ASED.TDE-BBFIT"
+if mask.any():
+   # Choose the first TDE
+    tde_info = df[mask].iloc[0].squeeze()
+    print(f"Found a TDE in region {region} with the following info:")
+    print(tde_info)
+else:
+    raise RuntimeError(f"No TDE found in region {region}.")
 ```
 
-## 3. Data Access
-To locate data covering the region identified by the TDE target, we begin by performing a cone search in the existing OpenUniverse2024 Roman + Rubin catalogs. This step identifies all known galaxies within some small radius of the TDE position identified above. The resulting catalog provides positions and IDs for each potential host galaxy.  With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
-
-+++
-
-### 3.1 Catalog access
-We use the "roman_rubin_cats_v1.1.2_faint" catalog (defined above as CATALOG_NAME) because it provides precise sky positions and unique galaxy IDs for all simulated Roman + Rubin sources, allowing us to later cross-match these galaxies with other derived quantities such as photometry or physical parameters.
-We select the full survey rather than the preview version because it covers a larger sky area and represents the more recent, higher-fidelity release of the OpenUniverse2024 simulations.
-"faint" in the catalog name refers to the deeper magnitude limit of the simulation.
+Once we have the TDE, we load the corresponding galaxy info parquet file for that region. Then we identify its host galaxy(s) by matching the host ID in the TDE info with the galaxy IDs in the galaxy info.
 
 ```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def cone_search_catalog(
-    ra_center,
-    dec_center,
-    radius_deg,
-    s3_prefix=(
-        f"s3://{BUCKET_NAME}/{OU_PREFIX}/roman/full/{CATALOG_NAME}"),
-):
-    """
-    Perform a cone search on the OpenUniverse2024 Roman/Rubin galaxy_info catalogs.
-
-    Parameters
-    ----------
-    ra_center : float
-        Right Ascension of the GW localization center (degrees, ICRS).
-    dec_center : float
-        Declination of the GW localization center (degrees, ICRS).
-    radius_deg : float
-        Search radius in degrees.
-    s3_prefix : str, optional
-        Root S3 prefix for the OpenUniverse Roman/Rubin catalogs.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Subset of galaxies within the cone, including:
-        ['galaxy_id', 'ra', 'dec', 'sep_arcsec'].
-    """
-
-    # Step 1. Determine which HEALPix tiles overlap the GW cone
-    healpix = ah.HEALPix(nside=32, order="ring")
-    pixels = healpix.cone_search_lonlat(
-        lon=ra_center, lat=dec_center , radius=radius_deg )
-    print(f"Identified {len(pixels)} overlapping HEALPix regions:{pixels}")
-
-    # Step 2. Load only those parquet region files from S3
-
-    # Connect to the public S3 bucket anonymously
-    fs = s3fs.S3FileSystem(anon=True)
-
-    region_paths = []
-    flux_paths = []
-
-    for pix in pixels:
-        region_path = f"{s3_prefix}/galaxy_{pix}.parquet"
-        flux_path   = f"{s3_prefix}/galaxy_flux_{pix}.parquet"
-
-        if fs.exists(region_path):
-            region_paths.append(region_path)
-            flux_paths.append(flux_path)
-
-    # If no files were found, the localization is likely outside the simulation’s sky coverage.
-    if not region_paths:
-        print(
-            "⚠️ No matching region files found — likely the GW localization "
-            "is outside the simulated sky area."
-        )
-        return pd.DataFrame(columns=["galaxy_id", "ra", "dec", "sep_arcsec"])
-
-    df_info = ds.dataset(region_paths, format="parquet", filesystem=fs)
-    df_flux = ds.dataset(flux_paths, format="parquet", filesystem=fs)
-
-    df_info = df_info.to_table().to_pandas()
-    df_flux = df_flux.to_table().to_pandas()
-
-    #merge info and flux tables
-    df_all = pd.merge(df_info, df_flux, on="galaxy_id", how="left")
-
-    # Step 3. Fine-grained cone search on sky coordinates
-
-    # Convert both the catalog and the GW center into SkyCoord objects
-    catalog_coords = SkyCoord(df_all["ra"].values * u.deg,
-                              df_all["dec"].values * u.deg)
-    center = SkyCoord(ra_center, dec_center)
-
-    # Compute angular separation between each galaxy and the GW position
-    sep = catalog_coords.separation(center)
-    df_all["sep_arcsec"] = sep.arcsec
-
-    # Keep only galaxies within the search radius
-    mask = sep <= (radius_deg)
-    df_subset = df_all[mask]
-
-    print(f"✅ Found {len(df_subset)} galaxies within {radius_deg:.3f}° "
-          f"of RA={ra_center:.3f}, Dec={dec_center:.3f}")
-
-    return df_subset
-```
-
-```{code-cell} ipython3
-df_candidates = cone_search_catalog(ra_center,dec_center,radius_deg)
-```
-
-```{code-cell} ipython3
-# Take a look at what we have in the dataframe of candidates.
+galaxy_info_file = f"{catalog_prefix}/galaxy_{region}.parquet"
+df_candidates = pq.read_table(galaxy_info_file, filesystem=fs,
+                              # filter while reading pq for time efficiency
+                              filters=[("galaxy_id", "==", tde_info["host_id"])]
+                              ).to_pandas()
 df_candidates
 ```
 
-### 3.2 Image access
-Now we need to find the filenames of the images in the TDS survey which include these targets
+## 3. Image Access
+Now we have `df_candidates` as a catalog of host galaxy(s) for our TDE target, including their positions and IDs. With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
 
 ```{code-cell} ipython3
----
-jupyter:
-  source_hidden: true
----
-def TDS_image_search(ra_center, dec_center, radius_deg, bandname,
-                    s3_prefix=f"{BUCKET_NAME}/{OU_PREFIX}/{ROMAN_TDS_PREFIX}/"):
-    """
-    Query OpenUniverse2024 Roman/Rubin TDS images within a given sky radius.
+# Make astroquery IRSA queries point to the simulated VO endpoints
+# Must be connected to IPAC VPN or local network to access these endpoints
+# TODO: replace irsadev with irsa when simulated SIA is deployed to Ops
+Irsa.sia_url = "https://irsadev.ipac.caltech.edu/simulated/SIA"
+Irsa.tap_url = "https://irsadev.ipac.caltech.edu/simulated/TAP"
 
-    Parameters
-    ----------
-    ra_center : float
-        Right Ascension of the GW localization center (degrees, ICRS).
-    dec_center : float
-        Declination of the GW localization center (degrees, ICRS).
-    radius_deg : float
-        Search radius in degrees.
-    bandname : string
-        bandname for which to do photometry
-    s3_prefix : str, optional
-        Root path to the OpenUniverse Roman/Rubin images on S3.
+Irsa.list_collections(servicetype='SIA')
+```
 
-    Returns
-    -------
-    image_filenames : list (str)
-        Should start with the str "s3://"
-    """
-
-    # This is a fudging of the image access part so I can keep working
-    image_filenames = [
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_10.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_11.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_12.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_13.fits.gz',
-        'nasa-irsa-simulations/openuniverse2024/roman/full/RomanTDS/images/simple_model/J129/10190/Roman_TDS_simple_model_J129_10190_14.fits.gz']
-
-    #make these the correct path with the s3 prepended on the front
-    image_filenames = [f"s3://{path}" for path in image_filenames]
-
-    return image_filenames
+```{code-cell} ipython3
+OU_ROMAN_SIA_COLLECTION = 'simulated_roman_openuniverse2024'
+OU_RUBIN_SIA_COLLECTION = 'simulated_rubin_openuniverse2024'
 ```
 
 ```{code-cell} ipython3
@@ -414,91 +295,162 @@ def TDS_image_search(ra_center, dec_center, radius_deg, bandname,
 jupyter:
   source_hidden: true
 ---
-def add_image_filenames(df_candidates, radius_deg, bandname):
+def get_s3_fpath(cloud_access):
+    cloud_info = json.loads(cloud_access) # converts str to dict
+    bucket_name = cloud_info['aws']['bucket_name']
+    key = cloud_info['aws']['key']
+
+    return f's3://{bucket_name}/{key}'
+```
+
+First, we find the filenames of the images in the Roman TDS survey which include these galaxy candidates.
+
+```{code-cell} ipython3
+---
+jupyter:
+  source_hidden: true
+---
+def TDS_image_search(df_candidates, radius, bandname):
     """
-    For each galaxy candidate, use TDS_image_search() to find nearby images
-    and store results as a nested column inside `df_candidates`.
+    Get OpenUniverse2024 Roman TDS images for each galaxy candidate.
 
     Parameters
     ----------
     df_candidates : pandas.DataFrame
-        Must include at least 'ra' and 'dec' columns.
-    radius_deg : float
-        Search radius in degrees passed to TDS_image_search().
+        Must include 'galaxy_id', 'ra', and 'dec' columns.
+    radius : astropy.units.Quantity
+        Search radius.
     bandname : string
-        name of the filter to use
+        Bandname for which to do photometry.
 
     Returns
     -------
-    pandas.DataFrame
-        The same DataFrame that was passed in, now containing an added
-        column ``"image_filenames"``. Each entry of this column is a
-        list of strings with the S3 paths of overlapping TDS images.
+    dict
+        Dictionary where keys are galaxy IDs and values are SIA result tables
+        with an added 's3_uri' column for the image file paths.
     """
+    image_map = {}
+    for _, row in df_candidates.iterrows():
+        galaxy_id = int(row["galaxy_id"])
+        ra_center, dec_center = row["ra"], row["dec"]
+        print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra_center:.3f}, Dec={dec_center:.3f} ...", end="")
 
-    # Store filenames for each candidate
-    filenames_all = []
+        coords = SkyCoord(ra_center, dec_center, unit='deg')
+        sia_results = Irsa.query_sia(pos=(coords, radius.to(u.deg)), collection=OU_ROMAN_SIA_COLLECTION)
+        filtered_results = sia_results[['TDS_simple_model' in row['obs_id'] and bandname in row['energy_bandpassname']
+                                        for row in sia_results]]
+        filtered_results['s3_uri'] = [get_s3_fpath(row['cloud_access']) for row in filtered_results]
 
-    for idx, row in df_candidates.iterrows():
-        ra, dec = row["ra"], row["dec"]
-        filenames = TDS_image_search(ra, dec, radius_deg, bandname)
-        filenames_all.append(filenames)
+        print(f"done. Found {len(filtered_results)} images.")
+        image_map[galaxy_id] = filtered_results
 
-    df_candidates["image_filenames"] = filenames_all
-
-    return df_candidates
+    return image_map
 ```
 
 ```{code-cell} ipython3
 bandname = "J129"
-df_candidates = add_image_filenames(df_candidates, radius_deg, bandname)
+image_search_radius = 1 * u.arcsec # point-like since we just need images containing the candidate
+candidates_images = TDS_image_search(df_candidates, image_search_radius, bandname)
 ```
 
-```{code-cell} ipython3
-#note our dataframe now contains a column with a list of filenames per candidate host galaxy
-df_candidates
-```
-
-## 4.  Make a Light Curve
-This section demonstrates how to extract and visualize a light curve for a potential gravitational-wave host galaxy using simulated Roman images. The first function, `run_aperture_photometry()`, performs simple circular aperture photometry on a set of FITS images from S3 using the astropy [photutils](https://photutils.readthedocs.io/en/stable/) package . The second function, `plot_light_curve()`, then compiles these measurements into a time-ordered plot showing how the observed flux evolves across multiple visits, providing a first look at temporal variability that could signal transient activity or host-galaxy changes.
+Since there are > 100 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images based on MJD quantiles.
 
 ```{code-cell} ipython3
 ---
 jupyter:
   source_hidden: true
 ---
-def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
+def select_images_by_mjd_quantiles(images, n_select=9):
+    """
+    Select up to `n_select` images using rank-quantiles on time axis.
+
+    Parameters
+    ----------
+    images : astropy Table
+        Table of images (SIA results).
+    n_select : int, optional
+        Maximum number of images to select. Default is 9.
+
+    Returns
+    -------
+    astropy Table
+        Subset of input `images` corresponding to the selected quantiles.
+    """
+    sorted_images = images.copy()  # avoid modifying the original table
+    sorted_images.sort('t_min') # sort by time axis, t_min = t_max for TDS images, so we can use either
+    num_quantiles = min(n_select, len(sorted_images))
+    quantile_indices = np.rint(  # round off to nearest integer
+        np.linspace(0, len(sorted_images) - 1, num_quantiles)
+    ).astype(int)
+    return sorted_images[quantile_indices]
+```
+
+```{code-cell} ipython3
+image_filenames = []
+
+for _, row in df_candidates.iterrows():
+    galaxy_id = int(row["galaxy_id"])
+    selected_images = select_images_by_mjd_quantiles(candidates_images[galaxy_id])
+    print(f"Galaxy {galaxy_id}: Downsampled {len(candidates_images[galaxy_id])} images to {len(selected_images)} images selected by MJD quantiles.")
+    
+    image_filenames.append(selected_images['s3_uri'].tolist())
+
+df_candidates["image_filenames"] = image_filenames
+```
+
+```{code-cell} ipython3
+# check if we have a nested column of image filenames for each candidate
+df_candidates
+```
+
+## 4.  Make a Light Curve
+This section demonstrates how to extract and visualize a light curve for a Tidal Disruption Event using simulated Roman images. 
+The first function, `run_aperture_photometry()`, performs simple circular aperture photometry on a set of FITS images from S3 using the astropy [photutils](https://photutils.readthedocs.io/en/stable/) package. 
+The second function, `plot_light_curve()`, then compiles these measurements into a time-ordered plot showing how the observed flux evolves across multiple visits, providing a first look at temporal variability that could signal transient activity or host-galaxy changes.
+
+```{code-cell} ipython3
+---
+jupyter:
+  source_hidden: true
+---
+def run_aperture_photometry(df_candidates, bandname, image_column="image_filenames", aperture_radius=1.0):
     """
     Perform circular aperture photometry on a list of FITS images.
 
     Parameters
     ----------
     df_candidates : pandas.DataFrame
-        Must contain columns 'ra', 'dec', and a nested column 'image_filenames'
+        Must contain columns 'ra', 'dec', and a nested column with FITS image paths
         (each a list of FITS image paths).
     bandname : string
         Bandname for which to do photometry.
+    image_column : string, optional
+        Name of the dataframe column containing lists of FITS image paths.
+        Default is "image_filenames".
     aperture_radius : float, optional
-        Aperture radius in pixels. Default is 3.0.
+        Aperture radius in arcsec. Default is 1.0 arcseconds which is ~9 pixels for Roman .
 
     Returns
     -------
     phot_df : pandas.DataFrame
         DataFrame containing the photometry results with columns:
         ['RA', 'Dec', 'mjd_obs', 'filename', 'flux', 'flux_err',
-         'aperture_radius', 'background']
+         'aperture_radius_pix', 'background']
     """
 
     #store photometry for all rows in the dataframe
     #these will be lists of lists
-    mjd_all, flux_all, flux_err_all = [], [], []
+    mjd_all, flux_all, flux_err_all, aperture_radius_pix_all = [], [], [], []
 
     #for each candidate galaxy:
     for idx, row in df_candidates.iterrows():
-        filenames = row["image_filenames"]
+        filenames = row[image_column]
+        print(f"Performing photometry for {len(filenames)} sampled images "
+              f"for the candidate at RA={row['ra']:.3f}, Dec={row['dec']:.3f} ...", end="")
+
 
         #setup to store for each candidate galaxy
-        mjd_list, flux_list, flux_err_list = [], [], []
+        mjd_list, flux_list, flux_err_list, aperture_radius_pix_list = [], [], [], []
 
 
         for fname in filenames:
@@ -508,14 +460,16 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
                 data = hdul[1].data
                 header = hdul[1].header
 
-                # Placeholder pixel coordinates for now
-                position = [(40, 40)]
+                # Build a WCS object so photutils can convert between sky and pixel coordinates.
+                wcs = WCS(header)
 
-                # Simple circular aperture
-                aperture = CircularAperture(position, r=aperture_radius)
+                # Simple circular aperture centered on the candidate galaxy position
+                sky_position = SkyCoord(row["ra"], row["dec"], unit="deg", frame="icrs")
+                aperture = SkyCircularAperture(sky_position, r=aperture_radius * u.arcsec)
+                pixel_aperture = aperture.to_pixel(wcs)
 
                 # Perform aperture photometry
-                phot_table = aperture_photometry(data, aperture)
+                phot_table = aperture_photometry(data, aperture, wcs=wcs)
 
                 # Check output (optional)
                 #print(phot_table)
@@ -524,34 +478,41 @@ def run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0):
                 background = np.nanmedian(data)
 
                 # Subtract background from aperture sum
-                flux = phot_table['aperture_sum'][0] - background * np.pi * aperture_radius**2
+                aperture_area = pixel_aperture.area
+                flux = phot_table['aperture_sum'][0] - background * aperture_area
 
                 # Approximate uncertainty from background rms
-                flux_err = np.nanstd(data) * np.sqrt(np.pi * aperture_radius**2)
+                flux_err = np.nanstd(data) * np.sqrt(aperture_area)
 
                 # Observation mid-time from MJD-OBS
                 mjd_obs = header.get('MJD-OBS', None)
 
-                #store info
+                #store related info
                 mjd_list.append(mjd_obs)
                 flux_list.append(flux)
                 flux_err_list.append(flux_err)
+                aperture_radius_pix_list.append(float(pixel_aperture.r))
 
 
         mjd_all.append(mjd_list)
         flux_all.append(flux_list)
         flux_err_all.append(flux_err_list)
+        aperture_radius_pix_all.append(aperture_radius_pix_list)
+        print("done.")
+
 
     # Add as nested columns
     df_candidates["mjd_obs"] = mjd_all
     df_candidates[f"flux_{bandname}"] = flux_all
     df_candidates[f"flux_err_{bandname}"] = flux_err_all
+    df_candidates["aperture_radius_pix"] = aperture_radius_pix_all
 
     return df_candidates
 ```
 
 ```{code-cell} ipython3
-df = run_aperture_photometry(df_candidates, bandname, aperture_radius=3.0)
+# We choose an aperture radius of 1.0 arcsec(~9 Roman pixels at 0.11"/pix)
+df = run_aperture_photometry(df_candidates, bandname, aperture_radius= 1.0)
 ```
 
 ```{code-cell} ipython3
@@ -698,19 +659,13 @@ def plot_candidate_light_curves(df, bandname):
 
 ```{code-cell} ipython3
 #grab one of the galaxy_ids from the printed out dataframe above
-favorite = 10306000022321
+favorite = int(df.iloc[0]['galaxy_id'])
 fig_single = plot_single_light_curve(df, favorite, bandname)
 ```
-
-This will look better when they are a real time series and not all taken at the same time, also the warning about xlim being set to the same min and max will go away.
 
 ```{code-cell} ipython3
 fig_all_candidates = plot_candidate_light_curves(df, bandname)
 ```
-
-all galaxy ids are faked to have the same set of images for photometry hence the points exactly line on top of each other.
-
-+++
 
 ## 5. Make Cutouts
 We follow the example in this [tutorial](https://caltech-ipac.github.io/irsa-tutorials/openuniverse2024-roman-simulated-timedomainsurvey/) to display cutouts of the potential host galaxies as a function of time with the time listed in the cutout title.
@@ -776,14 +731,14 @@ def make_cutout(fname, ra, dec, size=100):
 
         rot_wcs = WCS(header)
 
-        #fudge the build cutout for now since we don't have RA and Dec of our sources worked out yet
-        position = (40, 40)
-        cutout = Cutout2D(img, position, size, mode="partial")
-
-        # Build cutout  (real version)
-        #cutout = Cutout2D(rot_img, coord, size, wcs=rot_wcs, mode="partial")
-
-        return cutout
+        try:
+            # Build cutout
+            cutout = Cutout2D(rot_img, coord, size, wcs=rot_wcs, mode="partial")
+            return cutout
+        except Exception as e:
+            print(f"Error creating cutout for {fname}: {e}")
+            return None
+        
 ```
 
 ```{code-cell} ipython3
@@ -791,8 +746,8 @@ def make_cutout(fname, ra, dec, size=100):
 jupyter:
   source_hidden: true
 ---
-def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
-                   galaxy_id=None, superevent_id=None):
+def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list, size=100, ncols=4,
+                   galaxy_id=None):
     """
     Display a gallery of cutouts centered on (RA, Dec) for a list of Roman TDS images.
 
@@ -800,33 +755,34 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
     ----------
     image_filenames : list of str
         List of S3 image filenames.
+    mjd_list : list-like
+        Observation MJD values aligned with `image_filenames`.
     ra, dec : float
         Target coordinates in degrees.
+    aperture_radius_pix_list : list of float
+        Aperture radius values in pixels, aligned with `image_filenames`.
     size : int or float, optional
         Cutout size in pixels. Default = 100.
     ncols : int, optional
         Number of columns in the gallery grid. Default = 4.
     galaxy_id : int or str, optional
         Galaxy ID for labeling the plot.
-    superevent_id : str, optional
-        GW superevent ID for labeling the plot.
 
     Returns
     -------
     fig : matplotlib.figure.Figure
         The displayed figure object.
     """
-    # Initialize lists to store image cutouts and observation times
-    cutouts, mjd_list = [], []
+    # Initialize lists to store image cutouts, observation times, and aligned pixel radii.
+    cutouts, mjds, radii_pix = [], [], []
 
-    # Loop over all image filenames and generate cutouts
-    for fname in image_filenames:
+    # Loop over all image filenames and generate cutouts and only keep MJDs and pixel radii for those with valid cutouts
+    for fname, mjd, radius_pix in zip(image_filenames, mjd_list, aperture_radius_pix_list):
         cutout = make_cutout(fname, ra, dec, size=size)
         if cutout is not None:
-            cutouts.append(cutout.data)
-            # Open FITS header to extract observation time (MJD)
-            with fits.open(f"s3://{fname}", fsspec_kwargs={"anon": True}, memmap=False) as hdu:
-                mjd_list.append(hdu[1].header.get("MJD-OBS", np.nan))
+            cutouts.append(cutout)
+            mjds.append(mjd)
+            radii_pix.append(radius_pix)
 
     # Stop if no valid cutouts were created
     if not cutouts:
@@ -839,9 +795,9 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
     axes = np.atleast_1d(axes).ravel()
 
     # Build figure title if information is available
-    if galaxy_id is not None and superevent_id is not None:
+    if galaxy_id is not None:
         fig.suptitle(
-            f"Cutouts of host galaxy candidate {galaxy_id} for GW event {superevent_id}",
+            f"Cutouts of host galaxy candidate {galaxy_id} for TDE event",
             fontsize=14, y=0.98
         )
     elif galaxy_id is not None:
@@ -851,9 +807,18 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
         )
 
     # Display each cutout image with contrast scaling and MJD label
-    for ax, img, mjd, fname in zip(axes, cutouts, mjd_list, image_filenames):
+    for ax, cutout, mjd, radius_pix in zip(axes, cutouts, mjds, radii_pix):
+        img = cutout.data
         vmin, vmax = np.nanpercentile(img, [5, 99])
         ax.imshow(img, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+        # Draw the aperture circle in the cutout
+        sky_center = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+        x_center, y_center = cutout.wcs.world_to_pixel(sky_center)
+        if np.isfinite(radius_pix) and radius_pix > 0:
+            aperture_circle = plt.Circle((x_center, y_center), radius_pix,
+                                         edgecolor="cyan", facecolor="none", linewidth=1.3)
+            ax.add_patch(aperture_circle)
+
         ax.set_title(f"MJD {mjd:.2f}", fontsize=8)
         ax.axis("off")
 
@@ -867,17 +832,22 @@ def cutout_gallery(image_filenames, ra, dec, size=100, ncols=4,
 ```
 
 ```{code-cell} ipython3
-# galaxy_id of my favorite candidate
-favorite = 10306000022321
+# make cutout gallery of my favorite candidate
 
-single_gal = df[df["galaxy_id"] == favorite]
+single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
+selected_filenames = single_gal["image_filenames"]
+selected_mjds = single_gal["mjd_obs"]
+selected_radius_pix = single_gal["aperture_radius_pix"]
+
 cutout_gallery(
-    image_filenames=single_gal["image_filenames"].iloc[0],
-    ra=single_gal["ra"].iloc[0],
-    dec=single_gal["dec"].iloc[0],
+    image_filenames=selected_filenames,
+    mjd_list=selected_mjds,
+    ra=single_gal["ra"],
+    dec=single_gal["dec"],
+    aperture_radius_pix_list=selected_radius_pix,
     size=100,
     ncols=3,
     galaxy_id=favorite,
@@ -905,13 +875,13 @@ Andreas Faisst, Vandana Desai
 **Contact:** [IRSA Helpdesk](https://irsa.ipac.caltech.edu/docs/help_desk.html) with questions
 or problems.
 
-**Runtime:** As of the date above, this notebook takes about 10 years to run to completion on
+**Runtime:** As of the date above, this notebook takes about 200s to run to completion on
 a machine with 8GB RAM and 4 CPU.
 
 
 **AI Acknowledgement:**
 
-This tutorial was developed with the assistance of OpenAI’s ChatGPT (GPT-5)
+This tutorial was developed with the assistance of AI tools
 
 **References:**
 
