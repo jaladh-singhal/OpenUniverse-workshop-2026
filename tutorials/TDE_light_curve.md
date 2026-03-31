@@ -353,7 +353,9 @@ image_search_radius = 1 * u.arcsec # point-like since we just need images contai
 candidates_images = TDS_image_search(df_candidates, image_search_radius, bandname)
 ```
 
-Since there are > 100 TDS images for each candidate which will take too much time for running photometry, we will select only a sample of images based on MJD quantiles.
+Since there are > 100 TDS images for each candidate, we will:
+1. filter out images where candidate is close to the edge of image so that photometry is more reliable and partial cutouts can be avoided.
+2. select only a sample of images based on MJD quantiles so that photometry is quicker to run.
 
 ```{code-cell} ipython3
 ---
@@ -390,11 +392,22 @@ image_filenames = []
 
 for _, row in df_candidates.iterrows():
     galaxy_id = int(row["galaxy_id"])
-    selected_images = select_images_by_mjd_quantiles(candidates_images[galaxy_id])
-    print(f"Galaxy {galaxy_id}: Downsampled {len(candidates_images[galaxy_id])} images to {len(selected_images)} images selected by MJD quantiles.")
+    candidate_images_tbl = candidates_images[galaxy_id]
+
+    # 1. filter out images where candidate is close to the edge of image
+    # 'dist_to_point' is the distance from the center of the image to the candidate
+    # 's_fov' is the estimated diameter of the circular region covered by the image
+    # so we keep images where candidate is within 0.45 * s_fov (= 90% from the image center)
+    selected_images = candidate_images_tbl[[row['dist_to_point'] < (0.45 * row['s_fov'])
+                                            for row in candidate_images_tbl]]
+
+    # 2. select images by MJD quantiles
+    selected_images = select_images_by_mjd_quantiles(selected_images)
+    print(f"Galaxy {galaxy_id}: Downsampled {len(candidate_images_tbl)} images to {len(selected_images)} images.")
     
     image_filenames.append(selected_images['s3_uri'].tolist())
 
+# add the S3 URIs of the selected images as a new column in the candidates dataframe
 df_candidates["image_filenames"] = image_filenames
 ```
 
